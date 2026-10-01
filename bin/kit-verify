@@ -244,7 +244,7 @@ PY
      effective_is browser.dialog_policy '"must_respond"' &&
      [[ -f $hermes_home/plugins/kit-logins/__init__.py && -f /etc/systemd/system/hermes-kit-logins-proxy.service ]] &&
      grep -Fq -- '--proxy-server=http://127.0.0.1:9223' /etc/systemd/system/hermes-kit-logins-browser.service &&
-     runuser -u hermes -- env HOME=/home/hermes HERMES_HOME="$hermes_root" "$HERMES_BIN" -p client plugins list --plain --no-bundled 2>/dev/null | grep -Eq 'kit-logins.*enabled'; then
+     runuser -u hermes -- env HOME=/home/hermes HERMES_HOME="$hermes_root" "$HERMES_BIN" -p client plugins list --plain --no-bundled 2>/dev/null | awk '$1 == "enabled" && $NF == "kit-logins" {found=1} END {exit !found}'; then
     pass 'LOGINS waiver, plugin, and website blocklist are active'
   else
     fail 'LOGINS waiver, plugin, or website blocklist missing'
@@ -283,7 +283,7 @@ if consent_exists builder; then
      runuser -u builder -- test ! -r "$hermes_home/.env" && runuser -u builder -- test ! -r /srv/tools/data;
   then pass 'BUILDER user and egress boundary'; else fail 'BUILDER user or egress boundary'; fi
   tools_ok=true
-  while IFS=$'\t' read -r tool port commit recorded_hash backup_at restore_at snapshot_file snapshot_hash; do
+  while IFS=$'\t' read -r tool port up commit recorded_hash backup_at restore_at snapshot_file snapshot_hash; do
     [[ -n $tool ]] || continue
     [[ -d /srv/tools/data/$tool ]] || { tools_ok=false; continue; }
     tool_canary=$(mktemp "/srv/tools/data/$tool/.kit-tool-canary.XXXXXX")
@@ -313,10 +313,15 @@ PY
       (( backup_epoch > 0 && $(date -u +%s) - backup_epoch < 129600 && restore_epoch > 0 )) || tools_ok=false
       if [[ ! -f /var/backups/tools/$tool/$snapshot_file ]] || [[ $(sha256sum "/var/backups/tools/$tool/$snapshot_file" 2>/dev/null | awk '{print $1}') != "$snapshot_hash" ]]; then tools_ok=false; fi
     fi
-    if [[ $port =~ ^[0-9]+$ && $commit =~ ^[0-9a-f]{40}$ ]]; then
-      [[ $(curl --silent --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null) == 403 ]] || tools_ok=false
+    if [[ $port =~ ^[0-9]+$ ]]; then
+      health_code=$(curl --silent --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || true)
+      if [[ $up == true ]]; then
+        [[ $health_code == 403 ]] || tools_ok=false
+      else
+        [[ $health_code == 000 ]] || tools_ok=false
+      fi
     fi
-  done < <(jq -r '.tools[]? | [.name, (.port // 0), (.commit // "-"), (.code_hash // "-"), (.last_backup_at // "-"), (.last_restore_test_at // "-"), (.snapshot_file // "-"), (.snapshot_sha256 // "-")] | @tsv' /srv/tools/registry.json 2>/dev/null)
+  done < <(jq -r '.tools[]? | [.name, (.port // 0), (.up // false), (.commit // "-"), (.code_hash // "-"), (.last_backup_at // "-"), (.last_restore_test_at // "-"), (.snapshot_file // "-"), (.snapshot_sha256 // "-")] | @tsv' /srv/tools/registry.json 2>/dev/null)
   if [[ $tools_ok == true ]]; then pass 'TOOL data isolation, egress and origin authentication'; else fail 'TOOL data isolation, egress or origin authentication'; fi
 fi
 if dotenv_assignments | validate_no_allow_all_values && effective_is gateway.allow_all_users false; then pass 'no enabled allow-all flag in loaded profile or configuration'; else fail 'no enabled allow-all flag in loaded profile or configuration'; fi

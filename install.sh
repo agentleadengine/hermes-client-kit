@@ -92,7 +92,7 @@ persist_kit_config "$CONFIG_FILE"
 
 # Keep every installed release available after a temporary update checkout is
 # removed. Helpers and units must never point at the caller's working tree.
-release_id=$(git -C "$KIT_DIR" rev-parse HEAD 2>/dev/null || sha256sum "$KIT_DIR/install.sh" | awk '{print $1}')
+release_id=$(runtime_tree_hash "$KIT_DIR")
 release_id=${release_id:0:64}
 KIT_RUNTIME_DIR="/opt/hermes-kit/versions/$release_id"
 if [[ $(readlink -f "$KIT_DIR") != "$KIT_RUNTIME_DIR" ]]; then

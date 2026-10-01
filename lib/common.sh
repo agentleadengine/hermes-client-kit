@@ -100,6 +100,13 @@ run_as_hermes() {
     bash -lc "$1"
 }
 
+runtime_tree_hash() (
+  cd "$1" || return
+  find install.sh kit.conf.example bin lib managed profile plugins support-profile templates \
+    -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0 |
+    sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1
+)
+
 run_as_hermes_root() {
   local hermes_uid
   hermes_uid=$(id -u "$HERMES_USER")

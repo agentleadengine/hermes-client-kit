@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from hermes_runtime import HERMES_BIN
 from sshd_transaction import apply as sshd_file_apply
 
@@ -208,6 +209,16 @@ def remove_team_key(fingerprint: str):
         # rejects new logins with the removed key immediately after the mirror.
 
 
+def remove_full_account():
+    for attempt in range(20):
+        deleted = run(["userdel", "--remove", "hermes-ops"], check=False, capture_output=True)
+        if run(["id", "-u", "hermes-ops"], check=False, capture_output=True).returncode:
+            return
+        if attempt == 19:
+            raise RuntimeError(f"Could not remove hermes-ops after revocation: {deleted.stderr.strip()}")
+        time.sleep(0.25)
+
+
 def full_access(action: str, path_or_fingerprint: str, waiver: str | None):
     require_root()
     if tier() != "full":
@@ -271,7 +282,7 @@ Match User hermes-ops
                 sshd_file_apply(Path("/etc/ssh/sshd_config.d/10-hermes-kit-access.conf"), None)
                 for file in (Path("/etc/sudoers.d/90-hermes-kit-hermes-ops"), Path("/etc/ssh/auth_principals/hermes-ops")):
                     file.unlink(missing_ok=True)
-                run(["userdel", "--remove", "hermes-ops"], check=False)
+                remove_full_account()
         ssh_reload()
         event("full-revoked", fingerprint=fingerprint)
 

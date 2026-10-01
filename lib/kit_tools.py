@@ -158,6 +158,7 @@ def setup():
     for path in (ROOT / "src", ROOT / "staging", ROOT / "releases", BACKUP):
         path.mkdir(parents=True, exist_ok=True)
     BACKUP.chmod(0o700)
+    (ROOT / "releases").chmod(0o755)
     if not TEST:
         run(["chown", "builder:builder", ROOT / "src", ROOT / "staging"])
     protect_data_parent()
@@ -267,10 +268,11 @@ def stage(name, source=None, template=False, commit=None):
     target = ROOT / "staging" / name / resolved
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "-c", f"safe.directory={bare}", "clone", "--quiet", "--no-hardlinks", bare, target])
-        run(["git", "-C", target, "checkout", "--quiet", "--detach", resolved])
         if not TEST:
-            run(["chown", "-R", "builder:builder", target])
+            run(["chown", "builder:builder", target.parent])
+            target.parent.chmod(0o700)
+        run(["git", "clone", "--quiet", "--no-hardlinks", bare, target], user="builder")
+        run(["git", "-C", target, "checkout", "--quiet", "--detach", resolved], user="builder")
     safe_tree(target)
     test_tool(target, user="builder")
     data = registry(); item = entry(data, name); item["staged"] = resolved; item["tests_ok"] = True
@@ -314,6 +316,14 @@ def hash_tree(path):
         digest.update(str(item.relative_to(path)).encode() + b"\0")
         digest.update(item.read_bytes())
     return digest.hexdigest()
+
+
+def make_release_readonly(path):
+    for item in [path, *path.rglob("*")]:
+        if item.is_dir():
+            item.chmod(0o555)
+        elif item.is_file():
+            item.chmod(0o555 if item.stat().st_mode & 0o111 else 0o444)
 
 
 def test_tool(path, user=None):
@@ -391,7 +401,7 @@ def publish(name, client, reviewer=None, ack_unreviewed=False):
     if not HASH.fullmatch(commit):
         raise ValueError("No staged commit")
     staged = ROOT / "staging" / name / commit
-    if not staged.exists() or run(["git", "-C", staged, "rev-parse", "HEAD"], capture=True).stdout.strip() != commit:
+    if not staged.exists() or run(["git", "-c", f"safe.directory={staged}", "-C", staged, "rev-parse", "HEAD"], capture=True).stdout.strip() != commit:
         raise ValueError("Staged commit changed")
     if not reviewer_signature(name, commit, reviewer) and not ack_unreviewed:
         raise ValueError("Reviewer signature or explicit unreviewed acknowledgment required")
@@ -448,14 +458,16 @@ def _publish_checked(name, client, reviewer, ack_unreviewed, data, item, commit,
         if not TEST:
             run(["chown", f"{user}:{user}", applied_file])
         release = ROOT / "releases" / name / commit
+        (ROOT / "releases").chmod(0o755)
         if not release.exists():
             release.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(clean, release, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
             if not TEST:
                 run(["chown", "-R", "root:root", release])
-                run(["chmod", "-R", "a-w", release])
         elif hash_tree(release) != hash_tree(clean):
             raise ValueError("Existing release does not match the staged commit")
+        release.parent.chmod(0o755)
+        make_release_readonly(release)
         current = release.parent / "current"
         temp_link = release.parent / ".current-next"
         temp_link.unlink(missing_ok=True)
@@ -532,19 +544,25 @@ def prepare_image(user, pinned_image):
     runtime = ["env", f"HOME=/home/{user}", f"XDG_RUNTIME_DIR=/run/user/{uid}"]
     if run(["podman", "image", "exists", pinned_image], check=False).returncode:
         run(["podman", "pull", pinned_image])
-    image_id = run(["podman", "image", "inspect", "--format", "{{.Id}}", pinned_image], capture=True).stdout.strip()
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        raise ValueError("Pinned image did not resolve to a local image ID")
+    image_id = canonical_image_id(run(["podman", "image", "inspect", "--format", "{{.Id}}", pinned_image], capture=True).stdout.strip())
     if run([*runtime, "podman", "image", "exists", image_id], user=user, check=False).returncode:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             archive = Path(temporary) / "image.tar"
-            run(["podman", "save", "--format", "oci-archive", "-o", archive, pinned_image])
+            run(["podman", "save", "--format", "docker-archive", "-o", archive, pinned_image])
             Path(temporary).chmod(0o755)
             archive.chmod(0o644)
             run([*runtime, "podman", "load", "-i", archive], user=user)
     if run([*runtime, "podman", "image", "exists", image_id], user=user, check=False).returncode:
         raise ValueError("Pinned image was not available in the isolated tool store")
     return image_id
+
+
+def canonical_image_id(value):
+    if re.fullmatch(r"[0-9a-f]{64}", value):
+        value = "sha256:" + value
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        raise ValueError("Pinned image did not resolve to a local image ID")
+    return value
 
 
 def validate_runtime():

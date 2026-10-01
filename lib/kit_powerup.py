@@ -28,6 +28,23 @@ def run(args: list[str]):
     subprocess.run(args, check=True)
 
 
+def local_chromium() -> str:
+    browser = shutil.which("chromium") or shutil.which("chromium-browser")
+    if not browser:
+        run(["apt-get", "-y", "--no-install-recommends", "install", "chromium-browser"])
+        browser = shutil.which("chromium") or shutil.which("chromium-browser")
+    # Ubuntu's Chromium snap can pull in and start the CUPS snap. Reinstalls
+    # must also close this public listener left by older kit releases.
+    if subprocess.run(
+        ["systemctl", "is-active", "--quiet", "snap.cups.cupsd.service"],
+        capture_output=True,
+    ).returncode == 0:
+        run(["systemctl", "disable", "--now", "snap.cups.cups-browsed.service", "snap.cups.cupsd.service"])
+    if not browser:
+        raise ValueError("Local Chromium is required for Logins")
+    return browser
+
+
 def config_set(key: str, value):
     if os.environ.get("KIT_POWERUP_TEST_MODE") == "1":
         path = ETC / "test-config.json"
@@ -172,7 +189,10 @@ def validate_cron_jobs():
     for job in jobs:
         if job.get("enabled") is False:
             continue
-        tools = set(job.get("enabled_toolsets", BASE_TOOLS))
+        configured_tools = job.get("enabled_toolsets")
+        if configured_tools is not None and not isinstance(configured_tools, list):
+            raise ValueError("Cron job toolset must be a list or null")
+        tools = set(BASE_TOOLS if configured_tools is None else configured_tools)
         if tools - set(BASE_TOOLS) or job.get("deliver", "local") != "local" or job.get("script") or job.get("monitor_script") or job.get("no_agent"):
             raise ValueError("Cron job has a non-read/draft toolset")
 
@@ -196,18 +216,16 @@ def install_logins():
         shutil.rmtree(target)
     shutil.copytree(source, target)
     (ETC / "kit-logins.installed").write_text("kit-logins\n")
+    target.parent.chmod(0o700)
+    target.chmod(0o755)
     if os.environ.get("KIT_POWERUP_TEST_MODE") != "1":
         run(["chown", "-R", "root:root", str(target)])
+        run(["chown", "hermes:hermes", str(target.parent)])
         run(["useradd", "--system", "--create-home", "--shell", "/usr/sbin/nologin", "logins"]) if subprocess.run(["id", "-u", "logins"], capture_output=True).returncode else None
         profiles = Path("/var/lib/hermes-kit/logins/profiles")
         profiles.mkdir(parents=True, exist_ok=True)
         run(["chown", "logins:logins", str(profiles)])
-        browser = shutil.which("chromium") or shutil.which("chromium-browser")
-        if not browser:
-            run(["apt-get", "-y", "--no-install-recommends", "install", "chromium-browser"])
-            browser = shutil.which("chromium") or shutil.which("chromium-browser")
-        if not browser:
-            raise ValueError("Local Chromium is required for Logins")
+        browser = local_chromium()
         run(["apt-get", "-y", "--no-install-recommends", "install", "nftables"])
         hermes_uid = pwd.getpwnam("hermes").pw_uid
         rules = ETC / "logins-cdp.nft"

@@ -5,7 +5,7 @@ state=/var/lib/agent-care/activation
 support=/var/lib/agent-care/support
 home=/var/lib/agent-care/home
 config=/etc/hermes-kit/kit.conf
-usage() { echo 'Usage: kit-activation {issue|home|close|open-support HOURS|revoke-support|expire}' >&2; exit 2; }
+usage() { echo 'Usage: kit-activation {issue|home|close|open-support HOURS|revoke-support|expire|reopen}' >&2; exit 2; }
 [[ ${EUID} -eq 0 ]] || { echo 'kit-activation must run as root.' >&2; exit 1; }
 [[ -r $config ]] || { echo 'Missing kit configuration.' >&2; exit 1; }
 script_dir=$(cd -- "$(dirname -- "$(readlink -f "$0")")/.." && pwd)
@@ -39,7 +39,24 @@ open_page() {
   systemctl enable --now caddy
   systemctl enable --now hermes-kit-activation.service
 }
+page_in_use() {
+  local expiry_file
+  for expiry_file in "$state/expires-at" "$support/expires-at" "$home/expires-at"; do
+    [[ -f $expiry_file && $(<"$expiry_file") =~ ^[0-9]+$ ]] && (( $(<"$expiry_file") > $(date -u +%s) )) && return 0
+  done
+  return 1
+}
 case ${1:-} in
+  reopen)
+    # A re-install during an open setup window must not take the client's page away. Reuse the existing host and
+    # token (the client already has the link); do nothing when no page is in use.
+    page_in_use || exit 0
+    [[ -s /etc/hermes-kit/activation-host ]] || { echo 'No activation host recorded.' >&2; exit 1; }
+    sed "s/{\$ACTIVATION_HOST}/$(< /etc/hermes-kit/activation-host)/g" "$script_dir/activation/Caddyfile" > /etc/caddy/Caddyfile
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+    open_page
+    systemctl enable --now hermes-kit-activation-expiry.timer
+    ;;
   issue)
     /usr/local/bin/kit-verify --tier "${KIT_TIER:-care}" >/dev/null
     issue_token "$state" /activate 48

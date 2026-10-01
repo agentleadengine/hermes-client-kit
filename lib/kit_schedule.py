@@ -29,19 +29,25 @@ def main():
     path = HOME / "cron" / "jobs.json"
     before = json.loads(path.read_text()) if path.exists() else []
     before = before if isinstance(before, list) else before.get("jobs", [])
-    subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "create", args.schedule, args.prompt, "--name", args.name, "--deliver", "local"], check=True)
+    created = subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "create", args.schedule, args.prompt, "--name", args.name, "--deliver", "local"], capture_output=True, text=True, check=False)
+    print(created.stdout, end="")
+    print(created.stderr, end="", file=sys.stderr)
     validate_cron_jobs()
     after = json.loads(path.read_text())
     after = after if isinstance(after, list) else after.get("jobs", [])
     old_ids = {str(x.get("id")) for x in before}
     new_ids = [str(x.get("id")) for x in after if str(x.get("id")) not in old_ids]
     if len(new_ids) != 1:
+        if created.returncode:
+            raise subprocess.CalledProcessError(created.returncode, created.args, created.stdout, created.stderr)
         raise ValueError("Cron creation did not produce exactly one reviewed job")
     ids_path = ETC / "schedules-ids.json"
     ids = json.loads(ids_path.read_text()) if ids_path.exists() else []
     ids.extend(new_ids)
     ids_path.write_text(json.dumps(ids) + "\n")
     ids_path.chmod(0o600)
+    if created.returncode:
+        print("Job was created and reviewed, but Hermes reported that the scheduler is not ready.", file=sys.stderr)
 
 
 if __name__ == "__main__":

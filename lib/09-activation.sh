@@ -64,3 +64,5 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl disable --now caddy hermes-kit-activation.service hermes-kit-activation-expiry.timer hermes-kit-support-expiry.timer hermes-kit-install-report.timer 2>/dev/null || true
+# Keep a client's open activation / Assistant Home / support page available across re-installs.
+/usr/local/bin/kit-activation reopen

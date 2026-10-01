@@ -8,6 +8,7 @@ gateway_service="hermes-gateway.service"
 for runtime_dir in sessions memory cron logs state runtime; do
   install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" "$HERMES_HOME/$runtime_dir"
 done
+install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" /home/hermes/.local/state
 install -m 0600 -o "$HERMES_USER" -g "$HERMES_USER" /dev/null /home/hermes/.hermes-kit-outside-vault-canary
 install -d -m 0755 "/etc/systemd/system/${gateway_service}.d"
 install -m 0644 /dev/stdin "/etc/systemd/system/${gateway_service}.d/docker-rootless.conf" <<EOF
@@ -17,6 +18,7 @@ Environment=HERMES_WRITE_SAFE_ROOT=/home/hermes/vault
 ProtectHome=tmpfs
 BindPaths=/home/hermes/vault
 BindReadOnlyPaths=/home/hermes/.local
+BindPaths=/home/hermes/.local/state
 BindPaths=/home/hermes/.hermes
 EOF
 

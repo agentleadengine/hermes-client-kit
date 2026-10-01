@@ -17,6 +17,10 @@ else
   chmod 0600 "$HERMES_HOME/.no-bundled-skills"
 fi
 run_as_hermes_root "'$HERMES_BIN' profile use '$HERMES_PROFILE_NAME'"
+install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" "$HERMES_HOME/plugins"
+if [[ -f /etc/hermes-kit/kit-logins.installed && -d "$HERMES_HOME/plugins/kit-logins" ]]; then
+  chmod 0755 "$HERMES_HOME/plugins/kit-logins"
+fi
 # AgentMail is the only mail capability shipped in the baseline. The official
 # skill documents its constrained inbox API; no client-mailbox skill is added.
 run_as_hermes_root '"$HERMES_BIN" -p client skills install official/email/agentmail --yes'
