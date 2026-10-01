@@ -1,0 +1,7 @@
+{$ACTIVATION_HOST} {
+  @private path /activate/* /support/* /home/*
+  handle @private {
+    reverse_proxy 127.0.0.1:8787
+  }
+  respond "This private setup page is not available." 404
+}

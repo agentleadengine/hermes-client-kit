@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Uses the documented AgentMail Python SDK, whose list result is structured,
+# rather than grepping human-oriented CLI output. It intentionally prints only
+# entries and never an API key.
+mode=${1:-}
+senders=${2:-}
+recipients=${3:-}
+: "${AGENTMAIL_API_KEY:?AGENTMAIL_API_KEY is required}"
+: "${AGENTMAIL_INBOX_ID:?AGENTMAIL_INBOX_ID is required}"
+[[ $mode == reconcile || $mode == verify ]] || { echo 'Usage: kit-agentmail-lists reconcile|verify senders recipients' >&2; exit 2; }
+
+python3 - "$mode" "$senders" "$recipients" <<'PY'
+import os, sys
+from agentmail import AgentMail
+
+mode, senders, recipients = sys.argv[1:]
+desired = {
+    "receive": {x.strip() for x in senders.split(",") if x.strip()},
+    "send": {x.strip() for x in recipients.split(",") if x.strip()},
+}
+client = AgentMail(api_key=os.environ["AGENTMAIL_API_KEY"])
+inbox = os.environ["AGENTMAIL_INBOX_ID"]
+
+def fields(result):
+    if hasattr(result, "model_dump"):
+        result = result.model_dump()
+    elif hasattr(result, "dict"):
+        result = result.dict()
+    if isinstance(result, dict):
+        return result
+    return vars(result)
+
+def entries(direction):
+    found, token = set(), None
+    while True:
+        kwargs = {"limit": 100}
+        if token:
+            kwargs["page_token"] = token
+        page = client.inboxes.lists.list(inbox, direction, "allow", **kwargs)
+        data = fields(page)
+        values = data.get("entries", data.get("items", data.get("data", [])))
+        for item in values:
+            item = fields(item) if not isinstance(item, dict) else item
+            value = item.get("entry")
+            if value:
+                found.add(value.strip())
+        token = data.get("next_page_token") or data.get("nextPageToken")
+        if not token:
+            return found
+
+for direction, wanted in desired.items():
+    actual = entries(direction)
+    if mode == "reconcile":
+        for entry in sorted(actual - wanted):
+            client.inboxes.lists.delete(inbox, direction, "allow", entry=entry)
+        for entry in sorted(wanted - actual):
+            client.inboxes.lists.create(inbox, direction, "allow", entry=entry)
+        actual = entries(direction)
+    if actual != wanted:
+        raise SystemExit(f"{direction} allowlist does not exactly match configured addresses")
+print("AgentMail inbox allowlists exactly match configured addresses.")
+PY

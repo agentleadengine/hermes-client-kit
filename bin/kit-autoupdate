@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state=/var/lib/hermes-kit/autoupdate
+config=/etc/hermes-kit/kit.conf
+pause_file=/etc/hermes-kit/autoupdate.paused
+command=${1:-run}
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
+[[ ${EUID} -eq 0 ]] || { echo 'kit-autoupdate must run as root.' >&2; exit 1; }
+record_outcome() {
+  install -d -m 0700 "$state"
+  jq -n --arg status "$1" --argjson sequence "${2:-0}" --arg at "$(date -u +%FT%TZ)" '{status:$status,sequence:$sequence,at:$at}' > "$state/outcome.json"
+  chown root:root "$state/outcome.json"; chmod 0600 "$state/outcome.json"
+}
+case $command in
+  pause) install -d -m 0700 /etc/hermes-kit; : > "$pause_file"; chmod 0600 "$pause_file"; record_outcome paused 0; echo 'Automatic updates paused by client.'; exit 0 ;;
+  resume) rm -f "$pause_file"; echo 'Automatic updates resumed.'; exit 0 ;;
+  run|now) ;;
+  *) echo 'Usage: kit-autoupdate [run|now|pause|resume]' >&2; exit 2 ;;
+esac
+[[ -e $pause_file ]] && { record_outcome paused 0; echo 'Automatic updates are paused.'; exit 0; }
+[[ -f $config ]] || { echo 'Missing kit configuration.' >&2; exit 1; }
+# shellcheck source=../lib/common.sh
+source "$kit_dir/lib/common.sh"
+# shellcheck source=../lib/sshd-transaction.sh
+source "$kit_dir/lib/sshd-transaction.sh"
+# shellcheck source=../lib/update-pointer.sh
+source "$kit_dir/lib/update-pointer.sh"
+load_kit_config "$config"
+if [[ -n ${KIT_CANARY_PROMOTED_SEQUENCE+x} ]] || grep -Eq '^KIT_CANARY_PROMOTED_SEQUENCE=' "$config"; then echo 'Remove obsolete KIT_CANARY_PROMOTED_SEQUENCE from kit.conf.' >&2; exit 1; fi
+channel=${KIT_CHANNEL:-stable}
+[[ $channel == stable || $channel == canary ]] || { echo 'KIT_CHANNEL must be stable or canary.' >&2; exit 1; }
+[[ -n ${KIT_UPDATE_REPO:-} && -n ${KIT_RELEASE_ALLOWED_SIGNER:-} && -n ${KIT_RELEASE_MANIFEST_URL:-} && -n ${KIT_RELEASE_SIGNER_ID:-} ]] || { echo 'Automatic updates are not configured.' >&2; exit 0; }
+[[ $KIT_RELEASE_MANIFEST_URL == https://* ]] || { echo 'KIT_RELEASE_MANIFEST_URL must use HTTPS.' >&2; exit 1; }
+install -d -m 0700 "$state"
+printf '%s\n' "$KIT_RELEASE_ALLOWED_SIGNER" > /etc/hermes-kit/release.allowed_signers
+chown root:root /etc/hermes-kit/release.allowed_signers; chmod 0644 /etc/hermes-kit/release.allowed_signers
+
+staging=$(mktemp -d /var/lib/hermes-kit/update.XXXXXX)
+trap 'rm -rf "$staging"' EXIT
+pointer_sequence=0
+if [[ $channel == stable ]]; then
+  pointer_url="${KIT_RELEASE_MANIFEST_URL%/}/stable.json"
+  curl --fail --silent --show-error --location --retry 6 --retry-all-errors --retry-delay 5 --retry-max-time 300 "$pointer_url" --output "$staging/stable.json"
+  curl --fail --silent --show-error --location --retry 6 --retry-all-errors --retry-delay 5 --retry-max-time 300 "$pointer_url.sig" --output "$staging/stable.json.sig"
+  pointer_sequence=$(verify_stable_pointer "$staging/stable.json" "$staging/stable.json.sig" /etc/hermes-kit/release.allowed_signers "$KIT_RELEASE_SIGNER_ID" "$state") || { echo 'Stable pointer is invalid, expired, or backwards.' >&2; exit 1; }
+fi
+git clone --no-checkout "$KIT_UPDATE_REPO" "$staging/repo" >/dev/null
+git -C "$staging/repo" fetch --force --tags origin >/dev/null
+if [[ $channel == stable ]]; then
+  tag=$(jq -r '.tag' "$staging/stable.json")
+else
+  tag=$(git -C "$staging/repo" tag --sort=-creatordate | head -n 1)
+fi
+[[ -n $tag && $(git -C "$staging/repo" cat-file -t "refs/tags/$tag") == tag ]] || { echo 'No annotated release tag found.' >&2; exit 1; }
+git -C "$staging/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/hermes-kit/release.allowed_signers verify-tag "$tag"
+commit=$(git -C "$staging/repo" rev-parse "$tag^{commit}")
+
+# The signed tag authenticates the release object. The manifest is fetched
+# separately and SSH-signed, avoiding the impossible self-hash of a manifest
+# committed inside the very commit it binds.
+manifest_url="${KIT_RELEASE_MANIFEST_URL%/}/$tag.json"
+curl --fail --silent --show-error --location --retry 6 --retry-all-errors --retry-delay 5 --retry-max-time 300 "$manifest_url" --output "$staging/manifest.json"
+curl --fail --silent --show-error --location --retry 6 --retry-all-errors --retry-delay 5 --retry-max-time 300 "$manifest_url.sig" --output "$staging/manifest.json.sig"
+ssh-keygen -Y verify -f /etc/hermes-kit/release.allowed_signers -I "$KIT_RELEASE_SIGNER_ID" -n hermes-kit-release -s "$staging/manifest.json.sig" < "$staging/manifest.json"
+manifest=$(<"$staging/manifest.json")
+sequence=$(jq -er '.sequence | select(type == "number" and floor == . and . >= 1)' <<<"$manifest")
+[[ $sequence =~ ^[1-9][0-9]*$ ]] || { echo 'Release sequence must be a positive integer.' >&2; exit 1; }
+[[ $(jq -r '.tag // empty' <<<"$manifest") == "$tag" && $(jq -r '.commit // empty' <<<"$manifest") == "$commit" ]] || { echo 'Signed release manifest does not bind this verified tag and commit.' >&2; exit 1; }
+created_at=$(jq -er '.created_at | strings' <<<"$manifest")
+expires_at=$(jq -er '.expires_at | strings' <<<"$manifest")
+created_epoch=$(date -u -d "$created_at" +%s) || { echo 'Release manifest has an invalid creation time.' >&2; exit 1; }
+expires_epoch=$(date -u -d "$expires_at" +%s) || { echo 'Release manifest has an invalid expiry time.' >&2; exit 1; }
+now=$(date -u +%s)
+(( created_epoch <= now && expires_epoch > now && now - created_epoch >= 259200 )) || { echo 'Authenticated release metadata has not completed the 72-hour soak or is stale.' >&2; exit 1; }
+pointer_allows_manifest "$channel" "$sequence" "$pointer_sequence" || { record_outcome held "$sequence"; echo 'Release sequence exceeds the signed stable pointer.' >&2; exit 1; }
+previous=$(cat "$state/sequence" 2>/dev/null || printf 0)
+previous_created=$(cat "$state/accepted-created" 2>/dev/null || printf 0)
+previous_expires=$(cat "$state/accepted-expires-epoch" 2>/dev/null || printf 0)
+[[ $previous =~ ^[0-9]+$ && $previous_created =~ ^[0-9]+$ && $previous_expires =~ ^[0-9]+$ ]] || { echo 'Invalid persisted update state.' >&2; exit 1; }
+if (( sequence == previous )) && [[ $(cat "$state/commit" 2>/dev/null || true) == "$commit" && $(readlink -f /opt/hermes-kit/current 2>/dev/null || true) == "/opt/hermes-kit/versions/$commit" ]]; then echo "Signed release $tag is already applied."; exit 0; fi
+(( sequence > previous && created_epoch > previous_created && expires_epoch > previous_expires )) || { echo 'Release sequence or authenticated freshness did not progress.' >&2; exit 1; }
+
+# Only execute the installer from the verified detached commit. It copies the
+# release to /opt/hermes-kit/versions before mutating services or helper links.
+git -C "$staging/repo" checkout --detach --force "$commit" >/dev/null
+install -d -m 0700 /var/backups/hermes-kit
+backup_dir=$(mktemp -d /var/backups/hermes-kit/autoupdate.XXXXXX)
+backup="$backup_dir/affected-components.tgz"
+ssh_snapshot="$backup_dir/ssh-config"
+install -d -m 0700 "$ssh_snapshot"
+for ssh_name in 00-hermes-kit.conf 10-hermes-kit-access.conf 11-hermes-kit-manager.conf 99-hermes-kit.conf; do
+  [[ ! -f /etc/ssh/sshd_config.d/$ssh_name ]] || cp -p "/etc/ssh/sshd_config.d/$ssh_name" "$ssh_snapshot/$ssh_name"
+done
+readlink -f /opt/hermes-kit/current > "$backup_dir/current-target" 2>/dev/null || true
+getent passwd hermes hermes-support hermes-ops ops > "$backup_dir/passwd" || true
+getent shadow hermes hermes-support hermes-ops ops > "$backup_dir/shadow" || true
+tar -C / -czf "$backup" --ignore-failed-read \
+  opt/hermes-kit etc/hermes etc/hermes-kit etc/systemd/system/hermes-support-gateway.service \
+  etc/systemd/system/hermes-kit-health.service etc/systemd/system/hermes-kit-health.timer \
+  etc/systemd/system/hermes-kit-report.service etc/systemd/system/hermes-kit-report.timer \
+  etc/systemd/system/hermes-kit-report-shutdown.service \
+  etc/systemd/system/hermes-kit-grant-cleanup.service etc/systemd/system/hermes-kit-grant-cleanup.timer \
+  etc/systemd/system/hermes-kit-autoupdate.service etc/systemd/system/hermes-kit-autoupdate.timer \
+  etc/ssh/kit etc/ssh/auth_principals etc/ssh/sshd_config.d/00-hermes-kit.conf \
+  etc/ssh/sshd_config.d/10-hermes-kit-access.conf etc/sudoers.d/90-hermes-kit-ops \
+  etc/sudoers.d/90-hermes-kit-hermes-ops home/hermes/.hermes/profiles/client var/lib/hermes-support
+
+rollback() {
+  tar -C / -xzf "$backup" --exclude='etc/ssh/sshd_config.d/*'
+  local -a ssh_restore=()
+  local ssh_name
+  for ssh_name in 00-hermes-kit.conf 10-hermes-kit-access.conf 11-hermes-kit-manager.conf 99-hermes-kit.conf; do
+    if [[ -f $ssh_snapshot/$ssh_name ]]; then
+      ssh_restore+=("/etc/ssh/sshd_config.d/$ssh_name" "$ssh_snapshot/$ssh_name")
+    else
+      ssh_restore+=("/etc/ssh/sshd_config.d/$ssh_name" --remove)
+    fi
+  done
+  sshd_files_apply "${ssh_restore[@]}" || return 1
+  for account in hermes hermes-support hermes-ops ops; do
+    grep -q "^$account:" "$backup_dir/passwd" || { id -u "$account" >/dev/null 2>&1 && userdel --remove "$account" || true; }
+  done
+  while IFS=: read -r name _ uid gid _ home shell; do
+    id -u "$name" >/dev/null 2>&1 || useradd -u "$uid" -g "$gid" -d "$home" -s "$shell" -M "$name"
+  done < "$backup_dir/passwd"
+  while IFS=: read -r name hash _; do usermod -p "$hash" "$name"; done < "$backup_dir/shadow"
+  [[ -s $backup_dir/current-target ]] && ln -sfn "$(cat "$backup_dir/current-target")" /opt/hermes-kit/current
+  systemctl daemon-reload
+  systemctl reload ssh || true
+  systemctl try-restart hermes-gateway.service hermes-support-gateway.service || true
+}
+if KIT_CONFIG="$config" "$staging/repo/install.sh" && /opt/hermes-kit/current/bin/kit-verify --tier "${KIT_TIER:-care}"; then
+  printf '%s\n' "$sequence" > "$state/sequence"
+  printf '%s\n' "$commit" > "$state/commit"
+  printf '%s\n' "$created_epoch" > "$state/accepted-created"
+  printf '%s\n' "$expires_epoch" > "$state/accepted-expires-epoch"
+  record_outcome applied "$sequence"
+  /opt/hermes-kit/current/bin/kit-health >/dev/null || true
+  echo "Applied signed release $tag."
+else
+  rollback
+  record_outcome failed "$sequence"
+  echo 'Update failed verification and every affected component was restored from snapshot.' >&2
+  exit 1
+fi

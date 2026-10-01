@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-set-support-key must run as root.' >&2; exit 1; }
+[[ -r /etc/hermes-kit/kit.conf ]] || { echo 'Support is not configured.' >&2; exit 1; }
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
+# shellcheck source=../lib/common.sh
+source "$kit_dir/lib/common.sh"
+load_kit_config /etc/hermes-kit/kit.conf
+case ${SUPPORT_PLATFORM:-none} in
+  telegram) expected=TELEGRAM_BOT_TOKEN ;;
+  photon) expected=PHOTON_PROJECT_SECRET ;;
+  whatsapp) expected=WHATSAPP_ENABLED ;;
+  signal) expected=SIGNAL_ACCOUNT ;;
+  slack) expected=SLACK_BOT_TOKEN ;;
+  *) echo 'A support platform must be configured before adding its credential.' >&2; exit 1 ;;
+esac
+[[ ${1:-} == "$expected" ]] || { echo "Usage: kit-set-support-key $expected" >&2; exit 2; }
+read -r -s -p "Value for $expected: " value
+printf '\n'
+[[ -n $value && $value != *$'\n'* && $value != *$'\r'* ]] || { echo 'A non-empty one-line value is required.' >&2; exit 1; }
+env_file=/var/lib/hermes-support/.env
+tmp=$(mktemp "${env_file}.XXXXXX")
+{ [[ -f $env_file ]] && grep -Ev "^${expected}=" "$env_file" || true; printf '%s=%q\n' "$expected" "$value"; } > "$tmp"
+chown hermes-support:hermes-support "$tmp"
+chmod 0600 "$tmp"
+mv "$tmp" "$env_file"
+systemctl try-restart hermes-support-gateway.service
+echo "Stored separate support credential $expected."

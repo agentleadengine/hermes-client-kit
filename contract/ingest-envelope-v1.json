@@ -1,0 +1,33 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "agent-care/ingest-envelope-v1.json",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "v": {
+   "const": 1
+  },
+  "agent_id": {
+   "type": "string",
+   "pattern": "^A[0-9]{2,4}$"
+  },
+  "sent_at": {
+   "type": "string",
+   "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+  },
+  "nonce": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{32}$"
+  },
+  "payload": {
+   "$ref": "health-schema-v3.json"
+  }
+ },
+ "required": [
+  "v",
+  "agent_id",
+  "sent_at",
+  "nonce",
+  "payload"
+ ]
+}

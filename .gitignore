@@ -1,0 +1,5 @@
+docs/reference/hermes-docs-full-*.txt
+.env
+*.env
+!.env.example
+kit.conf

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-expire-grants must run as root.' >&2; exit 1; }
+ledger=/var/lib/hermes-kit/grants/ledger.tsv
+[[ -f $ledger ]] || exit 0
+now=$(date -u +%s)
+script_dir=$(dirname "$(readlink -f "$0")")
+while IFS=$'\t' read -r serial grant_id expires waiver _; do
+  [[ $serial =~ ^[1-9][0-9]*$ && $grant_id =~ ^grant-[A-Za-z0-9._-]+$ && -n $expires && -n $waiver ]] || continue
+  expiry=$(date -u -d "$expires" +%s 2>/dev/null || printf 0)
+  (( expiry > 0 && expiry <= now )) || continue
+  if [[ -f "/var/lib/hermes-kit/grants/$grant_id-cert.pub" ]]; then
+    "$script_dir/kit-revoke-access" "$grant_id"
+    printf '%s grant-expired id=%s\n' "$(date -u +%FT%TZ)" "$grant_id" >> /var/lib/hermes-kit/access-events.log
+  fi
+done < "$ledger"

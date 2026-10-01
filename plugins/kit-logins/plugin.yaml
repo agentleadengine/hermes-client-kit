@@ -1,0 +1,5 @@
+name: kit-logins
+version: "1.0"
+description: Require approval for client browser actions and restrict sites.
+provides_hooks:
+  - pre_tool_call

@@ -1,0 +1,26 @@
+unauthorized_dm_behavior: ignore
+agent:
+  disabled_toolsets:
+    - file
+    - memory
+    - terminal
+    - code_execution
+    - browser
+    - computer_use
+    - delegation
+    - kanban
+    - cronjob
+    - image_gen
+    - tts
+    - homeassistant
+    - messaging
+    - web
+    - search
+    - vision
+platform_toolsets:
+  cli: [clarify, skills]
+  telegram: [clarify, skills]
+  photon: [clarify, skills]
+  whatsapp: [clarify, skills]
+  signal: [clarify, skills]
+  slack: [clarify, skills]

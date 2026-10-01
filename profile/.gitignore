@@ -1,0 +1,17 @@
+.env
+.env.EXAMPLE
+auth.json
+memories/
+sessions/
+logs/
+state.db*
+gateway.pid
+gateway_state.json
+workspace/
+home/
+backups/
+cache/
+local/
+cron/*
+!cron/jobs.json
+skills/.*

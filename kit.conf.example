@@ -1,0 +1,72 @@
+# Copy to kit.conf (or /etc/hermes-kit/kit.conf on cloud-init hosts) before install.
+# Never commit a populated kit.conf.
+CLIENT_NAME=""
+# Optional. Leave empty for Care tier, which has no operator key or standing access.
+OPS_SSH_PUBKEY=""
+# Intake accepts openai-codex, opencode-zen, or openai-compatible (mapped to Hermes custom).
+MODEL_PROVIDER="opencode-zen"
+MODEL_NAME=""
+# care, managed, full. Existing ludicrous installs are treated as full.
+KIT_TIER="care"
+KIT_AGENT_ID=""
+KIT_ENROLL_CODE=""
+KIT_HQ_URL=""
+
+# Intake metadata only. Unknown AGENT_CARE_* keys are ignored as data, never sourced.
+AGENT_CARE_REPORT_URL=""
+AGENT_CARE_JOB_ID=""
+AGENT_CARE_JOB_TOKEN=""
+AGENT_CARE_REQUESTED_PLATFORM=""
+
+# Pick exactly one channel. `none` keeps messaging disabled until onboarding.
+# Set only the matching documented allowlist. Never use an *_ALLOW_ALL_USERS key.
+MESSAGING_PLATFORM="none"
+PHOTON_ALLOWED_USERS=""
+TELEGRAM_ALLOWED_USERS=""
+WHATSAPP_ALLOWED_USERS=""
+SIGNAL_ALLOWED_USERS=""
+SLACK_ALLOWED_USERS=""
+# `agentmail` is the agent's own inbox, never the client's mailbox. List the
+# client's email addresses here, comma-separated. Recipients default to senders.
+MAIL_ALLOWED_SENDERS=""
+MAIL_ALLOWED_RECIPIENTS=""
+# Mail is a transport, not a chat channel. Mailroom results require one of the
+# already configured client channels below, never AgentMail itself.
+MAILROOM_NOTIFY_PLATFORM="none"
+
+# Required: the provisioning web app's cloud-init writes a reviewed, immutable
+# full Git commit SHA. Replace before running install.sh; floating builds fail.
+HERMES_COMMIT="REPLACE_WITH_REVIEWED_FULL_COMMIT_SHA"
+
+# Required: the provisioning web app's cloud-init writes this reviewed,
+# immutable image digest before running install.sh.
+SEARXNG_IMAGE="docker.io/searxng/searxng@sha256:REPLACE_WITH_REVIEWED_DIGEST"
+
+# Hindsight is disabled by default. When enabled, its API key is added separately
+# with: kit-set-key HINDSIGHT_LLM_API_KEY. These values configure local_embedded
+# Hindsight's extraction LLM and are not provider credentials themselves.
+ENABLE_HINDSIGHT="false"
+HINDSIGHT_LLM_PROVIDER="openai_compatible"
+HINDSIGHT_LLM_MODEL=""
+HINDSIGHT_LLM_BASE_URL=""
+
+# Optional: a pinned source ref for cloud-init installs.
+KIT_GIT_REF=""
+
+# Zero-access care support. Support messages are restricted to this stable ID
+# on the selected existing platform; leaving both empty keeps support offline.
+SUPPORT_PLATFORM="none"
+SUPPORT_ALLOWED_USER=""
+
+# Optional content-free OTLP health export. Remote endpoints must be HTTPS.
+OTLP_HEALTH_ENDPOINT=""
+
+# Pull updates are disabled until the client supplies all three reviewed values.
+KIT_UPDATE_REPO=""
+KIT_RELEASE_ALLOWED_SIGNER=""
+# HTTPS directory holding separately SSH-signed release manifests. A manifest
+# is deliberately outside the tagged commit so it can bind that commit hash.
+KIT_RELEASE_MANIFEST_URL=""
+KIT_RELEASE_SIGNER_ID=""
+# stable requires the signed stable pointer; canary bypasses promotion only.
+KIT_CHANNEL="stable"

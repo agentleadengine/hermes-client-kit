@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd)"
+backup_dir=/var/backups/hermes-kit
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+hermes_root=/home/hermes/.hermes
+hermes_profile=client
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-update must run as root.' >&2; exit 1; }
+config_file=${KIT_CONFIG:-/etc/hermes-kit/kit.conf}
+[[ -f $config_file ]] || { echo 'Missing persisted kit configuration.' >&2; exit 1; }
+# shellcheck source=../lib/common.sh
+source "$kit_dir/lib/common.sh"
+load_kit_config "$config_file"
+[[ ${HERMES_COMMIT:-} =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'HERMES_COMMIT must be a reviewed full Git SHA.' >&2; exit 1; }
+install -d -m 0700 "$backup_dir"
+tar -C /home/hermes -czf "$backup_dir/hermes-before-update-$stamp.tgz" .hermes
+find "$backup_dir" -type f -name 'hermes-before-update-*.tgz' -printf '%T@ %p\n' | sort -nr | awk 'NR > 5 {print $2}' | xargs -r rm -f
+
+run_as_hermes() {
+  local uid
+  uid=$(id -u hermes)
+  runuser -u hermes -- env HOME=/home/hermes HERMES_HOME="$hermes_root" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin bash -lc "$1"
+}
+# Hermes' update command follows the floating stable channel. Re-run the kit
+# installer instead so lib/03-hermes.sh reconciles the actual checkout to the
+# reviewed commit before profile assets are refreshed.
+KIT_CONFIG="$config_file" "$kit_dir/install.sh"
+run_as_hermes "'$HERMES_BIN' -p $hermes_profile profile update $hermes_profile --yes"
+# This wrapper runs from the root-operated maintenance path, outside the
+# gateway process that cannot safely restart itself during an update.
+systemctl restart hermes-gateway.service
+"$kit_dir/bin/kit-verify"

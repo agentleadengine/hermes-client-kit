@@ -1,0 +1,22 @@
+name: hermes-client
+version: 1.1.0
+description: Donna, a safe client-owned private Hermes baseline
+author: Hermes Client Kit
+license: MIT
+hermes_requires: ">=0.21.5"
+env_requires:
+  - name: OPENCODE_ZEN_API_KEY
+    description: Client-owned OpenCode Zen API key
+    required: true
+  - name: HINDSIGHT_LLM_API_KEY
+    description: Local-embedded Hindsight extraction LLM key, only when Hindsight is enabled
+    required: false
+    default: ""
+  - name: TELEGRAM_BOT_TOKEN
+    description: Telegram bot token, only when Telegram is selected
+    required: false
+    default: ""
+  - name: PHOTON_PROJECT_SECRET
+    description: Photon project secret, only when Photon iMessage is selected
+    required: false
+    default: ""

@@ -1,0 +1,604 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+failures=0
+warns=0
+results=()
+json_mode=false
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
+hermes_root=/home/hermes/.hermes
+hermes_profile=client
+hermes_home="$hermes_root/profiles/$hermes_profile"
+kit_config=${KIT_CONFIG:-/etc/hermes-kit/kit.conf}
+# JSON check identifiers are an allowlisted public vocabulary.  In particular,
+# never derive them from a failure description because that description may
+# contain a listener address, a contact identifier, or a credential name.
+check_id() {
+  case $1 in
+    *root*SSH*) printf '%s' CHECK_ROOT_SSH ;;
+    *password*authentication*) printf '%s' CHECK_SSH_PASSWORD_AUTH ;;
+    *UFW*) printf '%s' CHECK_UFW ;;
+    *listener*|*listens*) printf '%s' CHECK_NETWORK_LISTENERS ;;
+    *allowlist*|*ALLOWLIST*) printf '%s' CHECK_ALLOWLIST ;;
+    *credential*|*CREDENTIAL*) printf '%s' CHECK_CREDENTIAL_INVENTORY ;;
+    *health*|*HEALTH*) printf '%s' CHECK_HEALTH ;;
+    *support*|*SUPPORT*) printf '%s' CHECK_SUPPORT ;;
+    *CARE*) printf '%s' CHECK_CARE_ACCESS ;;
+    *LUDICROUS*) printf '%s' CHECK_LUDICROUS_ACCESS ;;
+    *MANAGED*) printf '%s' CHECK_MANAGED_ACCESS ;;
+    *BUILDER*) printf '%s' CHECK_BUILDER ;;
+    *TOOL*) printf '%s' CHECK_TOOLS ;;
+    *LOGINS*) printf '%s' CHECK_LOGINS ;;
+    *SCHEDULES*) printf '%s' CHECK_SCHEDULES ;;
+    *) printf '%s' CHECK_POLICY_BASELINE ;;
+  esac
+}
+pass() { local id; id=$(check_id "$1"); results+=("PASS"$'\t'"$id"); [[ $json_mode == true ]] || printf 'PASS %s %s\n' "$id" "$1"; }
+fail() { local id; id=$(check_id "$1"); results+=("FAIL"$'\t'"$id"); [[ $json_mode == true ]] || printf 'FAIL %s %s\n' "$id" "$1"; failures=$((failures + 1)); }
+warn() { local id; id=$(check_id "$1"); results+=("WARN"$'\t'"$id"); [[ $json_mode == true ]] || printf 'WARN %s %s\n' "$id" "$1"; warns=$((warns + 1)); }
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-verify must run as root.' >&2; exit 1; }
+# shellcheck source=../lib/common.sh
+source "$kit_dir/lib/common.sh"
+if [[ -f $kit_config ]]; then
+  load_kit_config "$kit_config"
+fi
+: "${KIT_TIER:=care}"
+tier=$KIT_TIER
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --tier) tier=${2:-}; shift 2 ;;
+    --json) json_mode=true; shift ;;
+    *) echo 'Usage: kit-verify [--tier care|managed|full] [--json]' >&2; exit 2 ;;
+  esac
+done
+[[ $tier == ludicrous ]] && tier=full
+[[ $tier =~ ^(care|managed|full)$ ]] || { echo 'tier must be care, managed, or full' >&2; exit 2; }
+: "${MESSAGING_PLATFORM:=none}"
+: "${SUPPORT_PLATFORM:=none}"
+: "${SUPPORT_ALLOWED_USER:=}"
+: "${MAIL_ALLOWED_SENDERS:=}"
+: "${MAIL_ALLOWED_RECIPIENTS:=$MAIL_ALLOWED_SENDERS}"
+consent_exists() {
+  local integration=$1
+  [[ -f /etc/hermes-kit/consents.json ]] && jq -e --arg integration "$integration" '.consents[]? | select(.integration == $integration)' /etc/hermes-kit/consents.json >/dev/null
+}
+
+effective_value() {
+  local path=$1
+  runuser -u hermes -- env HOME=/home/hermes HERMES_HOME="$hermes_root" PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin \
+    "$HERMES_BIN" -p "$hermes_profile" config get "$path" --json
+}
+effective_is() { [[ $(effective_value "$1" 2>/dev/null || true) == "$2" ]]; }
+canonical_json() { jq -c . 2>/dev/null; }
+effective_json_is() {
+  local actual expected
+  actual=$(effective_value "$1" 2>/dev/null | canonical_json || true)
+  expected=$(printf '%s' "$2" | canonical_json || true)
+  [[ -n $actual && $actual == "$expected" ]]
+}
+
+dotenv_value() {
+  local key=$1 hermes_python="$hermes_root/hermes-agent/.venv/bin/python"
+  [[ -x $hermes_python ]] || return 1
+  runuser -u hermes -- "$hermes_python" - "$hermes_home/.env" "$key" <<'PY'
+from dotenv import dotenv_values
+import sys
+value = dotenv_values(sys.argv[1], interpolate=True).get(sys.argv[2])
+if value is not None:
+    print(value)
+PY
+}
+
+dotenv_assignments() {
+  local hermes_python="$hermes_root/hermes-agent/.venv/bin/python"
+  if [[ -x $hermes_python ]]; then
+    runuser -u hermes -- "$hermes_python" - "$hermes_home/.env" <<'PY'
+from dotenv import dotenv_values
+import sys
+for key, value in dotenv_values(sys.argv[1], interpolate=True).items():
+    if key and value is not None:
+        print(f"{key}\t{value}")
+PY
+    return
+  fi
+  # The 0.21 source install does not guarantee a .venv at this path.  The kit
+  # writes one quoted, single-line assignment per key, which is enough to
+  # inspect enabled allow-all flags without importing an optional Python module.
+  awk '
+    /^[A-Z][A-Z0-9_]*=/ {
+      key = $0; sub(/=.*/, "", key)
+      value = $0; sub(/^[^=]*=/, "", value)
+      if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      print key "\t" value
+    }
+  ' "$hermes_home/.env"
+}
+
+is_loopback_address() {
+  case $1 in
+    127.*:*|'[::1]:'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+listener_addresses_for_port() {
+  local port=$1
+  ss -lntH | awk -v wanted="$port" '
+    {
+      address = $4
+      candidate = address
+      sub(/^.*:/, "", candidate)
+      if (candidate == wanted) print address
+    }
+  '
+}
+
+all_tcp_listeners_loopback() {
+  local port=$1 address found=false
+  while IFS= read -r address; do
+    found=true
+    is_loopback_address "$address" || return 1
+  done < <(listener_addresses_for_port "$port")
+  [[ $found == true ]]
+}
+
+dashboard_listener_addresses() {
+  local process_path pid command
+  for process_path in /proc/[0-9]*; do
+    pid=${process_path##*/}
+    command=$(tr '\0' ' ' <"$process_path/cmdline" 2>/dev/null || true)
+    [[ $command == *' dashboard '* ]] || continue
+    ss -lntpH 2>/dev/null | awk -v wanted_pid="$pid" '$0 ~ ("pid=" wanted_pid ",") { print $4 }'
+  done | sort -u
+}
+
+dashboard_is_only_loopback_9119() {
+  local address found=false
+  while IFS= read -r address; do
+    found=true
+    is_loopback_address "$address" || return 1
+    [[ ${address##*:} == 9119 ]] || return 1
+  done < <(dashboard_listener_addresses)
+  [[ $found == true ]]
+}
+
+if sshd -t; then pass 'sshd configuration parses'; else fail 'SSH_CONFIG_INVALID'; fi
+ssh_dropins=()
+for ssh_dropin in /etc/ssh/sshd_config.d/*hermes-kit*.conf; do
+  [[ ! -f $ssh_dropin ]] || ssh_dropins+=("$ssh_dropin")
+done
+if (( ${#ssh_dropins[@]} )) && ! awk 'tolower($1) == "match" { in_match=1 } in_match && tolower($1) == "permituserenvironment" { bad=1 } END { exit bad }' "${ssh_dropins[@]}"; then
+  fail 'SSH_MATCH_DIRECTIVE_INVALID'
+else
+  pass 'kit SSH Match blocks contain valid directives'
+fi
+sshd_effective=$(sshd -T 2>/dev/null || true)
+if grep -x 'permitrootlogin no' <<<"$sshd_effective" >/dev/null; then pass 'root SSH login disabled'; else fail 'root SSH login disabled'; fi
+if grep -x 'passwordauthentication no' <<<"$sshd_effective" >/dev/null; then pass 'SSH password authentication disabled'; else fail 'SSH password authentication disabled'; fi
+if ufw status verbose | grep >/dev/null 'Default: deny (incoming)'; then pass 'UFW default deny inbound'; else fail 'UFW default deny inbound'; fi
+if ufw status | grep >/dev/null 'Status: active'; then pass 'UFW active'; else fail 'UFW active'; fi
+
+non_loop_ports=$(ss -lntH | awk '
+  function loopback(address) {
+    return address ~ /^127\.[0-9]+\.[0-9]+\.[0-9]+:/ || address ~ /^\[::1\]:/
+  }
+  !loopback($4) {
+    address = $4
+    sub(/^.*:/, "", address)
+    print address
+  }
+' | sort -u || true)
+if [[ -z $non_loop_ports || $non_loop_ports == 22 ]]; then pass 'only SSH listens off loopback'; else fail "unexpected non-loopback listener(s): $non_loop_ports"; fi
+
+hermes_groups=$(id -nG hermes)
+if [[ $hermes_groups =~ (^|[[:space:]])(sudo|docker)($|[[:space:]]) ]]; then fail 'hermes is outside sudo and docker groups'; else pass 'hermes is outside sudo and docker groups'; fi
+if [[ $(stat -c '%U:%a' /etc/hermes/config.yaml 2>/dev/null) == root:644 ]]; then pass 'managed config is root-owned 0644'; else fail 'managed config is root-owned 0644'; fi
+if runuser -u hermes -- test ! -w /etc/hermes/config.yaml; then pass 'hermes cannot write managed config'; else fail 'hermes cannot write managed config'; fi
+if [[ $(stat -c '%U:%a' "$hermes_home/.env" 2>/dev/null) == hermes:600 ]]; then pass 'Hermes client-profile .env is hermes-owned 0600'; else fail 'Hermes client-profile .env is hermes-owned 0600'; fi
+if effective_is security.redact_secrets true; then pass 'secret redaction enabled'; else fail 'secret redaction enabled (effective config)'; fi
+if effective_is terminal.backend '"docker"'; then pass 'terminal backend is docker'; else fail 'terminal backend is docker (effective config)'; fi
+for check in 'security.tirith_enabled true Tirith-enabled' 'security.tirith_fail_open false Tirith-fails-closed' 'terminal.docker_network false Docker-terminal-network-disabled' 'approvals.mode "manual" manual-approvals' 'approvals.denial_breaker_threshold 3 denial-breaker' 'skills.write_approval true skill-write-approval' 'skills.guard_agent_created true skill-guard' 'memory.write_approval true memory-write-approval' 'updates.pre_update_backup "full" full-pre-update-backup'; do
+  read -r key expected label <<<"$check"
+  if effective_is "$key" "$expected"; then pass "$label effective config"; else fail "$label effective config"; fi
+done
+if effective_json_is approvals.deny '["git push --force*","*curl*|*sh*","dd if=* of=/dev/*"]'; then pass 'approval deny rules'; else fail 'approval deny rules'; fi
+approved_disabled='["terminal","code_execution","browser","computer_use","delegation","kanban","cronjob","image_gen","tts","homeassistant","messaging"]'
+approved_platform_tools='["clarify","file","memory","search","skills","todo","vision","web"]'
+if consent_exists logins; then
+  approved_disabled=$(jq -c 'map(select(. != "browser"))' <<<"$approved_disabled")
+  approved_platform_tools=$(jq -c '. + ["browser"]' <<<"$approved_platform_tools")
+fi
+cron_tools='["clarify","file","memory","search","skills","todo","vision","web"]'
+if effective_json_is agent.disabled_toolsets "$approved_disabled" && effective_json_is platform_toolsets.cli "$approved_platform_tools" && effective_json_is platform_toolsets.cron "$cron_tools"; then pass 'effective global and cron tool policy exactly matches approved capabilities'; else fail 'effective global and cron tool policy exactly matches approved capabilities'; fi
+if consent_exists logins; then
+  logins_domains=$(python3 - "$kit_dir/lib" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from kit_powerup import BLOCKED
+print(json.dumps(BLOCKED))
+PY
+)
+  if jq -e '.consents[]? | select(.integration == "logins" and .waiver_id != null and .waiver_id != "none")' /etc/hermes-kit/consents.json >/dev/null &&
+     effective_is security.website_blocklist.enabled true && effective_json_is security.website_blocklist.domains "$logins_domains" &&
+     effective_value plugins.enabled 2>/dev/null | jq -e 'type == "array" and index("kit-logins") != null' >/dev/null &&
+     effective_is browser.dialog_policy '"must_respond"' &&
+     [[ -f $hermes_home/plugins/kit-logins/__init__.py && -f /etc/systemd/system/hermes-kit-logins-proxy.service ]] &&
+     grep -Fq -- '--proxy-server=http://127.0.0.1:9223' /etc/systemd/system/hermes-kit-logins-browser.service &&
+     runuser -u hermes -- env HOME=/home/hermes HERMES_HOME="$hermes_root" "$HERMES_BIN" -p client plugins list --plain --no-bundled 2>/dev/null | grep -Eq 'kit-logins.*enabled'; then
+    pass 'LOGINS waiver, plugin, and website blocklist are active'
+  else
+    fail 'LOGINS waiver, plugin, or website blocklist missing'
+  fi
+fi
+if consent_exists schedules; then
+  if ! consent_exists logins && python3 - "$kit_dir/lib" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from kit_powerup import validate_cron_jobs
+validate_cron_jobs()
+PY
+  then pass 'SCHEDULES are local read and draft only'; else fail 'SCHEDULES unsafe job configuration'; fi
+elif [[ -f $hermes_home/cron/jobs.json ]] && jq -e '(if type == "array" then . else .jobs // [] end) | any(.[]; .enabled != false)' "$hermes_home/cron/jobs.json" >/dev/null 2>&1; then
+  fail 'SCHEDULES active without consent'
+fi
+if consent_exists builder; then
+  nft_rules=$(nft list table inet hermes_kit_tools 2>/dev/null || true)
+  if id -u builder >/dev/null 2>&1 && [[ $(stat -c '%a' /srv/tools/data 2>/dev/null) == 711 ]] &&
+     grep -Fq "skuid $(id -u builder)" <<<"$nft_rules" && grep -Fq 'builder_ipv4' <<<"$nft_rules" &&
+     runuser -u builder -- test ! -r /home/hermes/vault && runuser -u builder -- test ! -r "$hermes_home/memories" &&
+     runuser -u builder -- test ! -r "$hermes_home/.env" && runuser -u builder -- test ! -r /srv/tools/data;
+  then pass 'BUILDER user and egress boundary'; else fail 'BUILDER user or egress boundary'; fi
+  tools_ok=true
+  while IFS=$'\t' read -r tool port commit recorded_hash backup_at restore_at snapshot_file snapshot_hash; do
+    [[ -n $tool ]] || continue
+    [[ -d /srv/tools/data/$tool ]] || { tools_ok=false; continue; }
+    tool_canary=$(mktemp "/srv/tools/data/$tool/.kit-tool-canary.XXXXXX")
+    printf 'tool-cross-read-refused\n' > "$tool_canary"; chmod 0644 "$tool_canary"
+    for other_tool_dir in /srv/tools/data/*; do
+      [[ -d $other_tool_dir && ${other_tool_dir##*/} != "$tool" ]] || continue
+      if runuser -u "tool-${other_tool_dir##*/}" -- test -r "$tool_canary"; then tools_ok=false; fi
+    done
+    rm -f "$tool_canary"
+    if ! id -u "tool-$tool" >/dev/null 2>&1 || [[ $(stat -c '%U:%a' "/srv/tools/data/$tool" 2>/dev/null) != "tool-$tool:700" ]] ||
+       ! grep -Eq "skuid $(id -u "tool-$tool") drop" <<<"$nft_rules" ||
+       runuser -u builder -- test -r "/srv/tools/data/$tool" ||
+       runuser -u "tool-$tool" -- test -r /home/hermes/vault ||
+       [[ $commit =~ ^[0-9a-f]{40}$ && $(readlink -f "/srv/tools/releases/$tool/current" 2>/dev/null) != "/srv/tools/releases/$tool/$commit" ]] ||
+       [[ $commit =~ ^[0-9a-f]{40}$ && $(python3 - "$kit_dir/lib" "/srv/tools/releases/$tool/current" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from kit_tools import hash_tree
+from pathlib import Path
+print(hash_tree(Path(sys.argv[2])))
+PY
+) != "$recorded_hash" ]]; then tools_ok=false; fi
+    if [[ $commit =~ ^[0-9a-f]{40}$ ]]; then
+      backup_epoch=$(date -u -d "$backup_at" +%s 2>/dev/null || printf 0)
+      restore_epoch=$(date -u -d "$restore_at" +%s 2>/dev/null || printf 0)
+      (( backup_epoch > 0 && $(date -u +%s) - backup_epoch < 129600 && restore_epoch > 0 )) || tools_ok=false
+      if [[ ! -f /var/backups/tools/$tool/$snapshot_file ]] || [[ $(sha256sum "/var/backups/tools/$tool/$snapshot_file" 2>/dev/null | awk '{print $1}') != "$snapshot_hash" ]]; then tools_ok=false; fi
+    fi
+    if [[ $port =~ ^[0-9]+$ && $commit =~ ^[0-9a-f]{40}$ ]]; then
+      [[ $(curl --silent --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null) == 403 ]] || tools_ok=false
+    fi
+  done < <(jq -r '.tools[]? | [.name, (.port // 0), (.commit // "-"), (.code_hash // "-"), (.last_backup_at // "-"), (.last_restore_test_at // "-"), (.snapshot_file // "-"), (.snapshot_sha256 // "-")] | @tsv' /srv/tools/registry.json 2>/dev/null)
+  if [[ $tools_ok == true ]]; then pass 'TOOL data isolation, egress and origin authentication'; else fail 'TOOL data isolation, egress or origin authentication'; fi
+fi
+if dotenv_assignments | validate_no_allow_all_values && effective_is gateway.allow_all_users false; then pass 'no enabled allow-all flag in loaded profile or configuration'; else fail 'no enabled allow-all flag in loaded profile or configuration'; fi
+if effective_is unauthorized_dm_behavior '"ignore"'; then pass 'unknown direct messages are ignored'; else fail 'unknown direct messages are ignored'; fi
+if [[ -z $(dotenv_assignments | awk -F '\t' '$1 ~ /(_GROUP_ALLOWED_USERS|_ALLOWED_GROUPS)$/ {print}') ]]; then pass 'no group allowlists are configured'; else fail 'group access is closed'; fi
+# The dashboard is optional (the host gateway may start it on demand). The rule is exposure, not presence:
+# pass when nothing listens, or when every dashboard listener is loopback on 9119.
+if [[ -z $(listener_addresses_for_port 9119) && -z $(dashboard_listener_addresses) ]]; then pass 'dashboard is loopback-only (not running)';
+elif all_tcp_listeners_loopback 9119 && dashboard_is_only_loopback_9119; then pass 'dashboard is loopback-only'; else fail 'dashboard is loopback-only'; fi
+
+env_has_value() {
+  local key=$1
+  [[ -n $(dotenv_value "$key") ]]
+}
+case $MESSAGING_PLATFORM in
+  none)
+    warn 'messaging disabled by configuration'
+    ;;
+  photon)
+    messaging_allowlist=PHOTON_ALLOWED_USERS
+    messaging_secret=PHOTON_PROJECT_SECRET
+    ;;
+  telegram)
+    messaging_allowlist=TELEGRAM_ALLOWED_USERS
+    messaging_secret=TELEGRAM_BOT_TOKEN
+    ;;
+  whatsapp)
+    messaging_allowlist=WHATSAPP_ALLOWED_USERS
+    messaging_secret=WHATSAPP_ENABLED
+    ;;
+  signal)
+    messaging_allowlist=SIGNAL_ALLOWED_USERS
+    messaging_secret=SIGNAL_ACCOUNT
+    ;;
+  slack)
+    messaging_allowlist=SLACK_ALLOWED_USERS
+    messaging_secret=SLACK_BOT_TOKEN
+    ;;
+  agentmail)
+    messaging_allowlist=
+    messaging_secret=
+    ;;
+  *)
+    fail "unsupported MESSAGING_PLATFORM: $MESSAGING_PLATFORM"
+    messaging_allowlist=
+    messaging_secret=
+    ;;
+esac
+if [[ $MESSAGING_PLATFORM != none ]] && ! effective_is "platform_toolsets.$MESSAGING_PLATFORM" "$approved_platform_tools"; then fail "$MESSAGING_PLATFORM effective tool policy matches baseline"; fi
+if [[ -n ${messaging_allowlist:-} ]]; then
+  if validate_explicit_allowlist "$(dotenv_value "$messaging_allowlist")"; then pass "$MESSAGING_PLATFORM allowlist set"; else fail "$MESSAGING_PLATFORM allowlist set"; fi
+  if env_has_value "$messaging_secret"; then
+    if systemctl is-active --quiet hermes-gateway.service; then pass 'client gateway service active'; else fail 'client gateway service active'; fi
+  else
+    warn "$MESSAGING_PLATFORM credentials not configured"
+  fi
+fi
+if [[ $MESSAGING_PLATFORM == agentmail ]]; then
+  if validate_explicit_allowlist "$MAIL_ALLOWED_SENDERS" && validate_explicit_allowlist "$MAIL_ALLOWED_RECIPIENTS"; then pass 'AgentMail client lists are explicit'; else fail 'AgentMail client lists are explicit'; fi
+fi
+if env_has_value AGENTMAIL_INBOX_ID || env_has_value AGENTMAIL_API_KEY; then
+  if env_has_value AGENTMAIL_INBOX_ID && env_has_value AGENTMAIL_API_KEY && validate_explicit_allowlist "$MAIL_ALLOWED_SENDERS" && validate_explicit_allowlist "$MAIL_ALLOWED_RECIPIENTS" && AGENTMAIL_API_KEY="$(dotenv_value AGENTMAIL_API_KEY)" AGENTMAIL_INBOX_ID="$(dotenv_value AGENTMAIL_INBOX_ID)" "$kit_dir/bin/kit-agentmail-lists" verify "$MAIL_ALLOWED_SENDERS" "$MAIL_ALLOWED_RECIPIENTS" >/dev/null; then
+    pass 'AgentMail receive and send allowlists exactly match configuration'
+  else
+    fail 'AgentMail receive and send allowlists exactly match configuration'
+  fi
+elif [[ $MESSAGING_PLATFORM == agentmail ]]; then
+  warn 'mailroom not configured yet'
+fi
+
+if [[ -f "$hermes_home/distribution.yaml" ]]; then pass 'client profile distribution installed'; else fail 'client profile distribution installed'; fi
+if [[ -f "$hermes_home/SKILLS.sha256" ]] && cmp -s "$kit_dir/profile/SKILLS.sha256" "$hermes_home/SKILLS.sha256" && (cd "$hermes_home" && sha256sum -c SKILLS.sha256 >/dev/null); then pass 'shipped skill tree and baseline manifest match'; else fail 'shipped skill tree and baseline manifest match'; fi
+if [[ -e "$hermes_home/skills/productivity/google-workspace" ]]; then fail 'google-workspace skill absent by default'; else pass 'google-workspace skill absent by default'; fi
+actual_skills=$(cd "$hermes_home" && find skills -type f -name SKILL.md -printf '%P\n' | sort)
+manifest_skills=$(awk '{print $2}' "$hermes_home/SKILLS.sha256" 2>/dev/null | sed 's#^\./##; s#^skills/##' | sort)
+unconsented_skill=false
+while IFS= read -r skill; do
+  [[ -z $skill ]] && continue
+  if grep -Fxq "$skill" <<<"$manifest_skills"; then continue; fi
+  if [[ $skill == email/agentmail/SKILL.md ]] && [[ -f /etc/hermes-kit/official-agentmail.sha256 ]] && (cd "$hermes_home" && sha256sum -c /etc/hermes-kit/official-agentmail.sha256 >/dev/null); then continue; fi
+  consent_exists "${skill%/SKILL.md}" || unconsented_skill=true
+done <<<"$actual_skills"
+if [[ $unconsented_skill == false ]]; then pass 'profile skills are baseline or consented'; else fail 'unconsented profile skill present'; fi
+if [[ -f "$hermes_home/mcp.json" ]] && jq -e . "$hermes_home/mcp.json" >/dev/null 2>&1; then
+  unconsented_mcp=false
+  while IFS= read -r server; do [[ -z $server ]] || consent_exists "mcp:$server" || unconsented_mcp=true; done < <(jq -r 'if type == "object" then keys[] else empty end' "$hermes_home/mcp.json")
+  [[ $unconsented_mcp == false ]] && pass 'every MCP server is baseline or consented' || fail 'unconsented MCP server'
+else fail 'MCP configuration is valid JSON'; fi
+unconsented_plugin=false
+while IFS= read -r plugin; do
+  [[ -z $plugin || ${ENABLE_HINDSIGHT:-false} == true && $plugin == hindsight ]] && continue
+  consent_exists "plugin:$plugin" || unconsented_plugin=true
+done < <(find "$hermes_root/plugins" "$hermes_home/plugins" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -u)
+[[ $unconsented_plugin == false ]] && pass 'plugins are baseline or consented' || fail 'unconsented plugin present'
+unconsented_credential=false
+while IFS=$'\t' read -r key _; do
+  [[ $key =~ (API_KEY|TOKEN|SECRET|PASSWORD|OAUTH|IMAP|SMTP|EMAIL) ]] || continue
+  case $key in
+    AGENTMAIL_API_KEY|OPENCODE_ZEN_API_KEY|OPENCODE_GO_API_KEY|HINDSIGHT_LLM_API_KEY|"$messaging_secret") continue ;;
+    GMAIL_*|GOOGLE_*|OUTLOOK_*|IMAP_*|SMTP_*|EMAIL_*) fail "forbidden client-mailbox credential: $key"; unconsented_credential=true; continue ;;
+  esac
+  consent_exists "env:$key" || { fail "unconsented credential: $key"; unconsented_credential=true; }
+done < <(dotenv_assignments)
+[[ $unconsented_credential == false ]] && pass 'credential inventory is baseline or consented'
+if [[ -f "$hermes_home/skills/note-taking/obsidian/SKILL.md" ]]; then pass 'client profile obsidian skill present'; else fail 'client profile obsidian skill present'; fi
+if curl --fail --silent --show-error 'http://127.0.0.1:8080/search?q=hermes&format=json' >/dev/null 2>&1 && all_tcp_listeners_loopback 8080; then pass 'SearXNG answers on loopback only'; else fail 'SearXNG answers on loopback only'; fi
+syncthing_external=$(ss -lntuH | awk '
+  function loopback(address) {
+    return address ~ /^127\.[0-9]+\.[0-9]+\.[0-9]+:/ || address ~ /^\[::1\]:/
+  }
+  {
+    address = $4
+    port = address
+    sub(/^.*:/, "", port)
+    if ((port == "8384" || port == "22000" || port == "21027") && !loopback(address)) print address
+  }
+' | sort -u)
+if [[ -z $syncthing_external ]] && all_tcp_listeners_loopback 8384 && all_tcp_listeners_loopback 22000; then pass 'Syncthing GUI and synchronization listeners are loopback-only'; else fail "Syncthing has external or missing listener(s): ${syncthing_external:-missing required loopback listener}"; fi
+if [[ ${ENABLE_HINDSIGHT:-false} == true ]]; then
+  if [[ -f "$hermes_home/hindsight/config.json" ]] && grep -q '"mode": "local_embedded"' "$hermes_home/hindsight/config.json"; then pass 'Hindsight local-embedded configuration present'; else fail 'Hindsight local-embedded configuration present'; fi
+  if env_has_value HINDSIGHT_LLM_API_KEY; then pass 'Hindsight extraction key configured'; else warn 'Hindsight extraction key not configured'; fi
+else
+  warn 'Hindsight disabled by configuration; built-in memory remains active'
+fi
+if systemctl is-active --quiet docker.service || systemctl is-active --quiet docker.socket; then fail 'rootful Docker daemon is stopped'; else pass 'rootful Docker daemon is stopped'; fi
+searx_unit=/home/hermes/.config/systemd/user/searxng.service
+if [[ -f $searx_unit ]] && grep -E 'searxng@sha256:[0-9a-fA-F]{64}' "$searx_unit" >/dev/null && ! grep ':latest' "$searx_unit" >/dev/null; then pass 'SearXNG image digest pinned'; else fail 'SearXNG image digest pinned'; fi
+actual_revision=$(installed_hermes_revision 2>/dev/null || true)
+if [[ ${HERMES_COMMIT:-} =~ ^[0-9a-fA-F]{40}$ && $actual_revision == "$HERMES_COMMIT" ]]; then pass 'actual installed Hermes revision matches pin'; else fail 'actual installed Hermes revision matches pin'; fi
+gateway_props=$(systemctl show hermes-gateway.service -p ProtectHome -p BindPaths -p BindReadOnlyPaths --value 2>/dev/null || true)
+gateway_pid=$(systemctl show hermes-gateway.service -p MainPID --value 2>/dev/null || true)
+if grep -F tmpfs <<<"$gateway_props" >/dev/null && grep -F /home/hermes/vault <<<"$gateway_props" >/dev/null && grep -F /home/hermes/.local <<<"$gateway_props" >/dev/null && [[ $gateway_pid =~ ^[1-9][0-9]*$ ]] && nsenter -t "$gateway_pid" -m -- runuser -u hermes -- test ! -r /home/hermes/.hermes-kit-outside-vault-canary; then pass 'gateway outside-vault canary is unreadable'; else { if [[ ${KIT_TEST_CONTAINER_SANDBOX_UNVERIFIABLE:-} == 1 ]] && systemd-detect-virt --container -q; then warn 'gateway sandbox unverifiable in a container test host (verify on a real VM)'; else fail 'gateway outside-vault canary is unreadable'; fi; }; fi
+if "$kit_dir/bin/kit-lockdown" --dry-run >/dev/null; then pass 'kill switch dry run passes'; else fail 'kill switch dry run passes'; fi
+if grep -Fqi 'patient records' "$hermes_home/SOUL.md" && [[ -f "$kit_dir/DATA-MAP.md" ]]; then pass 'data policy and map present'; else fail 'data policy and map present'; fi
+if [[ $(stat -c '%U:%a' /etc/hermes-kit/consents.json 2>/dev/null) == root:600 ]] || [[ ! -e /etc/hermes-kit/consents.json ]]; then pass 'consent ledger ownership and permissions'; else fail 'consent ledger ownership and permissions'; fi
+if find "$hermes_root/profiles" -mindepth 1 -maxdepth 1 ! -name client -print -quit | grep . >/dev/null; then fail 'no unexpected Hermes profiles'; else pass 'no unexpected Hermes profiles'; fi
+if find "$hermes_home" -type l -print -quit | grep . >/dev/null; then fail 'profile state has no symlinks'; else pass 'profile state has no symlinks'; fi
+pending_memory=$(find "$hermes_home" -type f \( -iname '*pending*memory*' -o -path '*/memory/pending/*' \) -printf . 2>/dev/null | wc -c)
+if (( pending_memory > 20 )); then warn "memory review queue has $pending_memory pending item(s)"; else pass 'memory review queue is within limit'; fi
+if [[ -x /usr/local/bin/kit-access-log ]] && runuser -u hermes -- /usr/local/bin/kit-access-log >/dev/null; then pass 'client-readable operator access log refreshes'; else fail 'client-readable operator access log refreshes'; fi
+if systemctl is-active --quiet rsyslog; then pass 'authentication logging active'; else fail 'authentication logging active'; fi
+if systemctl is-enabled --quiet unattended-upgrades.service; then pass 'unattended upgrades enabled'; else fail 'unattended upgrades enabled'; fi
+if [[ $(stat -c '%U:%G:%a' /var/lib/hermes-kit/health.json 2>/dev/null) == root:hermes-support:640 ]] && jq -e '.schema == 3' /var/lib/hermes-kit/health.json >/dev/null 2>&1; then pass 'content-free health report ownership and schema'; else fail 'content-free health report ownership and schema'; fi
+health_age=999999
+[[ -f /var/lib/hermes-kit/health.json ]] && health_age=$(( $(date +%s) - $(stat -c %Y /var/lib/hermes-kit/health.json) ))
+if systemctl is-active --quiet hermes-kit-health.timer && (( health_age >= 0 && health_age <= 900 )); then pass 'health timer is active and fresh'; else fail 'HEALTH_TIMER_FRESHNESS'; fi
+if grep -Eq '^KIT_CANARY_PROMOTED_SEQUENCE=' "$kit_config" 2>/dev/null; then fail 'OBSOLETE_CANARY_PROMOTED_SEQUENCE'; else pass 'signed pointer configuration has no obsolete static sequence'; fi
+if [[ ${KIT_CHANNEL:-stable} == canary ]]; then
+  pass 'canary release channel selected'
+elif [[ ${KIT_CHANNEL:-stable} == stable && ${KIT_RELEASE_MANIFEST_URL:-} == https://* && -n ${KIT_RELEASE_SIGNER_ID:-} && -n ${KIT_RELEASE_ALLOWED_SIGNER:-} ]]; then
+  pass 'stable release pointer configuration present'
+elif [[ -f /var/lib/hermes-kit/report/enrolled-agent-id ]]; then
+  fail 'STABLE_POINTER_CONFIG'
+else
+  warn 'stable release pointer is not configured before enrollment'
+fi
+if [[ -e /etc/hermes-kit/report/box_ed25519.pem || -f /var/lib/hermes-kit/report/enrolled-agent-id ]]; then
+  if [[ $(stat -c '%U:%G:%a' /etc/hermes-kit/report/box_ed25519.pem 2>/dev/null) == root:root:600 ]]; then pass 'box report key is root owned with mode 0600'; else fail 'BOX_REPORT_KEY_PERMISSIONS'; fi
+else
+  warn 'box report key has not been generated'
+fi
+if [[ -f /var/lib/hermes-kit/report/enrolled-agent-id ]]; then
+  if [[ ${KIT_AGENT_ID:-} =~ ^A[0-9]{2,4}$ && ${KIT_HQ_URL:-} == https://* && $(< /var/lib/hermes-kit/report/enrolled-agent-id) == "$KIT_AGENT_ID" ]]; then pass 'enrolled box identity matches kit configuration'; else fail 'ENROLLED_BOX_IDENTITY'; fi
+  if systemctl is-active --quiet hermes-kit-report.timer; then pass 'signed report timer active after enrollment'; else fail 'REPORT_TIMER_INACTIVE'; fi
+else
+  warn 'box is not enrolled for signed reports'
+fi
+support_disabled='["file","memory","terminal","code_execution","browser","computer_use","delegation","kanban","cronjob","image_gen","tts","homeassistant","messaging","web","search","vision"]'
+support_tools='["clarify","skills"]'
+support_policy=false
+support_hermes=/opt/hermes-support-runtime/current/bin/hermes
+support_effective_json_is() {
+  local path=$1 expected=$2 actual canonical_expected
+  actual=$(runuser -u hermes-support -- env HOME=/var/lib/hermes-support HERMES_HOME=/var/lib/hermes-support PATH=/opt/hermes-support-runtime/current/bin:/usr/local/bin:/usr/bin:/bin \
+    "$support_hermes" config get "$path" --json 2>/dev/null | canonical_json || true)
+  canonical_expected=$(printf '%s' "$expected" | canonical_json || true)
+  [[ -n $actual && $actual == "$canonical_expected" ]]
+}
+if [[ -x $support_hermes && -f /var/lib/hermes-support/config.yaml ]] && support_effective_json_is agent.disabled_toolsets "$support_disabled" && support_effective_json_is platform_toolsets.cli "$support_tools"; then
+  support_policy=true
+fi
+if [[ $support_policy == true ]] && [[ -f /var/lib/hermes-support/skills/health-report/SKILL.md ]] && [[ ! -e /var/lib/hermes-support/mcp.json || $(jq -r 'length' /var/lib/hermes-support/mcp.json 2>/dev/null) == 0 ]]; then pass 'support effective tool policy is health-skill-only'; else fail 'SUPPORT_TOOL_POLICY'; fi
+if [[ $SUPPORT_PLATFORM == none ]] || { [[ $SUPPORT_ALLOWED_USER =~ ^[A-Za-z0-9._:@+-]{1,128}$ ]] && [[ $(grep -Ec '^[A-Z_]+_ALLOWED_USERS=' /var/lib/hermes-support/.env 2>/dev/null || true) == 1 ]] && grep -Fq "${SUPPORT_PLATFORM^^}_ALLOWED_USERS=\"$SUPPORT_ALLOWED_USER\"" /var/lib/hermes-support/.env; }; then pass 'support sender allowlist has exactly one stable ID'; else fail 'SUPPORT_SENDER_ID'; fi
+support_pid=$(systemctl show hermes-support-gateway.service -p MainPID --value 2>/dev/null || true)
+if [[ $SUPPORT_PLATFORM == none ]]; then
+  warn 'support gateway disabled by configuration'
+elif [[ -f /etc/systemd/system/hermes-support-gateway.service ]] && grep -Fqx 'InaccessiblePaths=/home/hermes /etc/hermes' /etc/systemd/system/hermes-support-gateway.service && grep -Fqx 'BindReadOnlyPaths=/var/lib/hermes-kit/health.json:/var/lib/hermes-support/health.json' /etc/systemd/system/hermes-support-gateway.service && [[ $support_pid =~ ^[1-9][0-9]*$ ]] && nsenter -t "$support_pid" -m -- runuser -u hermes-support -- test ! -r /home/hermes/.hermes/profiles/client/.env && nsenter -t "$support_pid" -m -- runuser -u hermes-support -- test ! -r /etc/hermes/config.yaml && nsenter -t "$support_pid" -m -- runuser -u hermes-support -- test -r /var/lib/hermes-support/health.json; then pass 'support namespace passes negative client-data read probes'; else fail 'SUPPORT_NAMESPACE_ISOLATION'; fi
+activation_in_use=false
+for expiry_file in /var/lib/agent-care/activation/expires-at /var/lib/agent-care/support/expires-at /var/lib/agent-care/home/expires-at; do
+  [[ -f $expiry_file && $(<"$expiry_file") =~ ^[0-9]+$ ]] && (( $(<"$expiry_file") > $(date -u +%s) )) && activation_in_use=true
+done
+if [[ $activation_in_use == true ]]; then
+  if systemctl is-active --quiet caddy && systemctl is-active --quiet hermes-kit-activation.service; then pass 'private activation page active only during a bounded flow'; else fail 'ACTIVATION_PAGE_ACTIVE'; fi
+elif ! systemctl is-active --quiet caddy && ! systemctl is-active --quiet hermes-kit-activation.service && ! { ufw status | grep -F 'hermes-kit-activation' >/dev/null; }; then
+  pass 'private activation page is off when unused'
+else
+  fail 'ACTIVATION_PAGE_OFF'
+fi
+if [[ -f /home/hermes/.local/state/syncthing/config.xml ]] && grep -q '<relaysEnabled>false</relaysEnabled>' /home/hermes/.local/state/syncthing/config.xml && grep -q '<globalAnnounceEnabled>false</globalAnnounceEnabled>' /home/hermes/.local/state/syncthing/config.xml; then pass 'Syncthing relays and global discovery disabled'; else fail 'Syncthing relays and global discovery disabled'; fi
+if [[ $tier == care || $tier == managed ]]; then
+  if [[ ! -s /etc/hermes-kit/full/authorized_keys && ! -s /etc/ssh/kit-full.keys ]]; then pass 'CARE has no standing full key'; else fail 'CARE_FULL_ACCESS_KEY'; fi
+  if ! id -u ops >/dev/null 2>&1 && ! id -u hermes-ops >/dev/null 2>&1 && { [[ $tier == managed ]] || ! id -u kit-manager >/dev/null 2>&1; }; then pass 'CARE has no operator Unix account'; else fail 'CARE_OPERATOR_ACCOUNT'; fi
+  if [[ ! -e /etc/sudoers.d/90-hermes-kit-ops && ! -e /etc/sudoers.d/90-hermes-kit-hermes-ops && ! -e /etc/ssh/auth_principals/hermes-ops ]]; then pass 'CARE has no operator sudo or SSH principal'; else fail 'CARE_OPERATOR_PRINCIPAL'; fi
+  if ! compgen -G '/var/lib/hermes-kit/grants/*-cert.pub' >/dev/null; then pass 'CARE has no active or expired operator certificate'; else fail 'CARE_OPERATOR_CERTIFICATE'; fi
+  if ! systemctl is-active --quiet hermes-kit-grant-cleanup.timer; then pass 'CARE grant expiry timer is inactive'; else fail 'CARE_GRANT_TIMER'; fi
+  if [[ $tier == managed ]]; then
+    if [[ -s /etc/hermes-kit/manager/authorized_keys && -s /etc/ssh/kit-manager.keys ]] && cmp -s /etc/hermes-kit/manager/authorized_keys /etc/ssh/kit-manager.keys; then
+      pass 'MANAGED manager key present'
+    manager_policy=$(sshd -T -C user=kit-manager,host=localhost,addr=127.0.0.1 2>/dev/null || true)
+    if grep -Fqx 'forcecommand /usr/local/sbin/kit-manage-dispatch' <<<"$manager_policy" && grep -Fqx 'permittty no' <<<"$manager_policy" && grep -Fqx 'allowtcpforwarding no' <<<"$manager_policy" && grep -Fqx 'allowagentforwarding no' <<<"$manager_policy"; then pass 'MANAGED ForceCommand and SSH restrictions'; else fail 'MANAGED_SSH_POLICY'; fi
+    manager_probe=true
+    private_paths=("$hermes_home/memories" "$hermes_home/sessions" "$hermes_home/state.db" /home/hermes/vault "$hermes_home/.env" "$hermes_home/auth.json" "$hermes_root/auth.json")
+    for tool_dir in /srv/tools/data/*; do [[ -d $tool_dir ]] && private_paths+=("$tool_dir"); done
+    for private in "${private_paths[@]}"; do
+      if [[ -d $private ]]; then
+        canary=$(mktemp "$private/.kit-manager-canary.XXXXXX")
+        printf 'manager-read-refused\n' > "$canary"
+        chmod 0644 "$canary"
+        if runuser -u kit-manager -- test -r "$canary"; then manager_probe=false; fi
+        rm -f "$canary"
+      elif [[ -f $private ]]; then
+        if runuser -u kit-manager -- test -r "$private"; then manager_probe=false; fi
+      elif [[ -d $(dirname "$private") ]]; then
+        canary=$(mktemp "$(dirname "$private")/.kit-manager-canary.XXXXXX")
+        printf 'manager-read-refused\n' > "$canary"
+        chmod 0644 "$canary"
+        if runuser -u kit-manager -- test -r "$canary"; then manager_probe=false; fi
+        rm -f "$canary"
+      fi
+    done
+    if runuser -u kit-manager -- test -r /srv/tools/data; then manager_probe=false; fi
+    if [[ $manager_probe == true ]]; then pass 'MANAGED private data unreadable'; else fail 'MANAGED_PRIVATE_DATA'; fi
+    if runuser -u kit-manager -- env SSH_ORIGINAL_COMMAND='cat /etc/hermes-kit/kit.conf' /usr/local/sbin/kit-manage-dispatch >/dev/null 2>&1; then fail 'MANAGED_NON_MENU_REFUSED'; else pass 'MANAGED non-menu command refused'; fi
+    elif [[ ! -s /etc/hermes-kit/manager/authorized_keys && ! -s /etc/ssh/kit-manager.keys ]]; then
+      pass 'MANAGED has no standing manager key yet'
+    else
+      fail 'MANAGED_MANAGER_KEY'
+    fi
+  elif [[ ! -e /etc/hermes-kit/manager/authorized_keys ]]; then pass 'CARE has no manager key'; else fail 'CARE_MANAGER_KEY'; fi
+else
+  ludicrous_valid=true
+  id -u hermes-ops >/dev/null 2>&1 || ludicrous_valid=false
+  [[ -f /etc/sudoers.d/90-hermes-kit-hermes-ops && -f /etc/ssh/auth_principals/hermes-ops && -f /etc/ssh/sshd_config.d/10-hermes-kit-access.conf && -f /etc/tlog/tlog-rec-session.conf ]] || ludicrous_valid=false
+  if [[ ! -s /etc/hermes-kit/full/authorized_keys ]]; then
+    [[ -s /var/lib/hermes-kit/grants/ledger.tsv ]] || ludicrous_valid=false
+    systemctl is-active --quiet hermes-kit-grant-cleanup.timer || ludicrous_valid=false
+  fi
+  sshd_effective_ops=$(sshd -T -C user=hermes-ops,host=localhost,addr=127.0.0.1 2>/dev/null || true)
+  grep -Fqx 'trustedusercakeys /etc/ssh/kit/client-ca.pub' <<<"$sshd_effective_ops" >/dev/null || ludicrous_valid=false
+  grep -Fqx 'authorizedprincipalsfile /etc/ssh/auth_principals/%u' <<<"$sshd_effective_ops" >/dev/null || ludicrous_valid=false
+  if [[ -s /etc/hermes-kit/full/authorized_keys ]]; then
+    grep -Fqx 'authorizedkeysfile /etc/ssh/kit-full.keys' <<<"$sshd_effective_ops" >/dev/null || ludicrous_valid=false
+  else
+    grep -Fqx 'authorizedkeysfile none' <<<"$sshd_effective_ops" >/dev/null || ludicrous_valid=false
+  fi
+  grep -Fqx 'revokedkeys /etc/ssh/kit/revoked.krl' <<<"$sshd_effective_ops" >/dev/null || ludicrous_valid=false
+  active_certificates=0
+  now_epoch=$(date -u +%s)
+  for certificate in /var/lib/hermes-kit/grants/*-cert.pub; do
+    [[ -f $certificate ]] || continue
+    active_certificates=$((active_certificates + 1))
+    grant_id=${certificate##*/}; grant_id=${grant_id%-cert.pub}
+    ledger_row=$(awk -F $'\t' -v grant="$grant_id" '$2 == grant {print; exit}' /var/lib/hermes-kit/grants/ledger.tsv)
+    [[ -n $ledger_row ]] || ludicrous_valid=false
+    IFS=$'\t' read -r serial ledger_grant expiry waiver fingerprint <<<"$ledger_row"
+    [[ $ledger_grant == "$grant_id" && -n $fingerprint ]] || ludicrous_valid=false
+    expiry_epoch=$(date -u -d "${expiry:-invalid}" +%s 2>/dev/null || printf 0)
+    [[ $serial =~ ^[1-9][0-9]*$ && -n ${waiver:-} && $expiry_epoch -gt $now_epoch ]] || ludicrous_valid=false
+    ssh-keygen -Lf "$certificate" | grep -A1 '^        Principals:' | grep -Fx '                ops' >/dev/null || ludicrous_valid=false
+    # Zero means unrevoked for ssh-keygen -Q. Any other state is invalid.
+    ssh-keygen -Q -f /etc/ssh/kit/revoked.krl "$certificate" >/dev/null 2>&1 || ludicrous_valid=false
+  done
+  (( active_certificates > 0 )) || [[ -s /etc/hermes-kit/full/authorized_keys ]] || ludicrous_valid=false
+  [[ $ludicrous_valid == true ]] && pass 'LUDICROUS_BOUNDED_ACCESS' || fail 'LUDICROUS_BOUNDED_ACCESS'
+fi
+no_known_secret_patterns() {
+  python3 - /etc/hermes "$hermes_home"/SOUL.md "$hermes_home"/config.yaml "$hermes_home"/mcp.json "$hermes_home"/distribution.yaml "$hermes_home"/skills <<'PY'
+from pathlib import Path
+import re
+import sys
+
+openai_key = re.compile(r'\bsk-[A-Za-z0-9_-]{16,}\b')
+google_key = re.compile(r'\bAIza[A-Za-z0-9_-]{20,}\b')
+telegram_token = re.compile(r'(?m)^\s*(?:export\s+)?TELEGRAM_BOT_TOKEN\s*=\s*["\']?([0-9]{5,}:[A-Za-z0-9_-]{20,})')
+
+def is_placeholder(token: str, prefix: str) -> bool:
+    body = token[len(prefix):]
+    return bool(body) and all(character.lower() == 'x' for character in body)
+
+for root_name in sys.argv[1:]:
+    root = Path(root_name)
+    paths = root.rglob('*') if root.is_dir() else (root,)
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            continue
+        if any(not is_placeholder(match.group(), 'sk-') for match in openai_key.finditer(text)):
+            sys.exit(1)
+        if any(not is_placeholder(match.group(), 'AIza') for match in google_key.finditer(text)):
+            sys.exit(1)
+        if telegram_token.search(text):
+            sys.exit(1)
+sys.exit(0)
+PY
+}
+if no_known_secret_patterns; then pass 'no known secret patterns in managed or client profile files'; else fail 'no known secret patterns in managed or client profile files'; fi
+
+if [[ $json_mode == true ]]; then
+  printf '%s\n' "${results[@]}" | jq -R 'split("\t") | select((length == 2) and (.[0] | IN("PASS","FAIL","WARN")))' | jq -sc --argjson failures "$failures" --argjson warnings "$warns" '{checks: map({status:.[0],id:.[1]}),failures:$failures,warnings:$warnings}'
+else
+  printf 'Summary: %s failure(s), %s warning(s)\n' "$failures" "$warns"
+fi
+(( failures == 0 ))

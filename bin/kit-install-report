@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config=${KIT_INSTALL_REPORT_CONFIG:-/etc/hermes-kit/kit.conf}
+state=${KIT_INSTALL_REPORT_STATE_DIR:-/var/lib/agent-care/install-report}
+[[ ${EUID} -eq 0 || ${KIT_INSTALL_REPORT_TEST_MODE:-} == 1 ]] || { echo 'kit-install-report must run as root.' >&2; exit 1; }
+[[ $# -eq 0 || ( $# -eq 1 && ( $1 == --failed || $1 == --installed ) ) ]] || { echo 'Usage: kit-install-report [--failed|--installed]' >&2; exit 2; }
+[[ -r $config ]] || { echo 'Missing kit configuration.' >&2; exit 1; }
+script_dir=$(cd -- "$(dirname -- "$(readlink -f "$0")")/.." && pwd)
+# shellcheck source=../lib/common.sh
+source "$script_dir/lib/common.sh"
+load_kit_config "$config"
+[[ -n ${AGENT_CARE_REPORT_URL:-} ]] || exit 0
+[[ $AGENT_CARE_REPORT_URL == https://* && -n ${AGENT_CARE_JOB_ID:-} ]] || { echo 'Agent Care report settings are incomplete.' >&2; exit 1; }
+install -d -m 0700 "$state"
+if [[ ${1:-} == --failed ]]; then
+  : > "$state/final-failure"
+  chmod 0600 "$state/final-failure"
+fi
+
+# Activation URL is generated only after a successful verification. Its handoff
+# file is root-only and is removed only after the receiver acknowledges it.
+if [[ -f $state/final-failure && ${1:-} != --installed ]]; then
+  payload=$(jq -cn --arg job_id "$AGENT_CARE_JOB_ID" '{jobId:$job_id,status:"failed"}')
+else
+  if [[ ! -f /var/lib/agent-care/activation/handoff-url ]]; then
+    /usr/local/bin/kit-activation issue
+  fi
+  verify_json=$(/usr/local/bin/kit-verify --json --tier "${KIT_TIER:-care}" || true)
+  jq -e '(.failures == 0) and (.checks | type == "array")' <<<"$verify_json" >/dev/null || { echo 'Refusing an installation report without successful verification.' >&2; exit 1; }
+  activation_url=$(< /var/lib/agent-care/activation/handoff-url)
+  payload=$(jq -cn --arg job_id "$AGENT_CARE_JOB_ID" --arg activation_url "$activation_url" '{jobId:$job_id,status:"installed",verification:"passed",activationUrl:$activation_url}')
+  rm -f "$state/final-failure"
+fi
+payload_file=$(mktemp "$state/payload.XXXXXX")
+trap 'rm -f "$payload_file"' EXIT
+printf '%s' "$payload" > "$payload_file"; chmod 0600 "$payload_file"
+headers=(-H 'Content-Type: application/json')
+if [[ -n ${AGENT_CARE_JOB_TOKEN:-} ]]; then
+  signature=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$AGENT_CARE_JOB_TOKEN" -binary | od -An -v -tx1 | tr -d ' \n')
+  headers+=(-H "Authorization: Bearer $AGENT_CARE_JOB_TOKEN" -H "X-Agent-Care-Job-Token: $AGENT_CARE_JOB_TOKEN" -H "X-Agent-Care-Signature: sha256=$signature")
+fi
+if curl --fail --silent --show-error --max-time 20 --retry 6 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
+  "${headers[@]}" --data-binary "@$payload_file" "$AGENT_CARE_REPORT_URL" >/dev/null 2>/dev/null; then
+  date -u +%FT%TZ > "$state/acknowledged-at"; chmod 0600 "$state/acknowledged-at"
+  if [[ ! -f $state/final-failure ]]; then rm -f /var/lib/agent-care/activation/handoff-url; fi
+  systemctl disable --now hermes-kit-install-report.timer 2>/dev/null || true
+  exit 0
+fi
+# A temporary receiver outage does not make a safe install fail. The private
+# handoff remains root-only and the timer retries the identical payload.
+systemctl enable --now hermes-kit-install-report.timer 2>/dev/null || true
+exit 0

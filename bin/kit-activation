@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state=/var/lib/agent-care/activation
+support=/var/lib/agent-care/support
+home=/var/lib/agent-care/home
+config=/etc/hermes-kit/kit.conf
+usage() { echo 'Usage: kit-activation {issue|home|close|open-support HOURS|revoke-support|expire}' >&2; exit 2; }
+[[ ${EUID} -eq 0 ]] || { echo 'kit-activation must run as root.' >&2; exit 1; }
+[[ -r $config ]] || { echo 'Missing kit configuration.' >&2; exit 1; }
+script_dir=$(cd -- "$(dirname -- "$(readlink -f "$0")")/.." && pwd)
+# shellcheck source=../lib/common.sh
+source "$script_dir/lib/common.sh"
+load_kit_config "$config"
+
+close_443() {
+  systemctl disable --now hermes-kit-activation.service 2>/dev/null || true
+  systemctl stop caddy 2>/dev/null || true
+  while IFS= read -r number; do ufw --force delete "$number" || true; done < <(ufw status numbered 2>/dev/null | sed -n '/hermes-kit-activation/s/^\[ *\([0-9]*\)\].*/\1/p' | sort -rn)
+}
+issue_token() {
+  local directory=$1 route=$2 hours=$3 token salt host
+  install -d -m 0700 "$directory"
+  token=$(openssl rand -hex 32); salt=$(openssl rand -hex 32)
+  printf '%s' "$salt" > "$directory/salt"; printf '%s' "$salt$token" | sha256sum | awk '{print $1}' > "$directory/token.sha256"
+  date -u -d "+${hours} hours" +%s > "$directory/expires-at"
+  chmod 0600 "$directory/salt" "$directory/token.sha256" "$directory/expires-at"
+  host=$(curl --fail --silent --show-error --max-time 10 https://api64.ipify.org 2>/dev/null || true)
+  [[ $host =~ ^[0-9a-fA-F:.]+$ ]] || { echo 'Could not determine the public address for activation.' >&2; return 1; }
+  printf '%s.sslip.io' "$host" > /etc/hermes-kit/activation-host
+  sed "s/{\$ACTIVATION_HOST}/$(< /etc/hermes-kit/activation-host)/g" "$script_dir/activation/Caddyfile" > /etc/caddy/Caddyfile
+  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+  install -d -m 0700 /var/lib/agent-care
+  umask 077; printf 'https://%s%s/%s\n' "$(< /etc/hermes-kit/activation-host)" "$route" "$token" > "$directory/handoff-url"
+}
+open_page() {
+  ufw allow 443/tcp comment 'hermes-kit-activation'
+  systemctl daemon-reload
+  systemctl enable --now caddy
+  systemctl enable --now hermes-kit-activation.service
+}
+case ${1:-} in
+  issue)
+    /usr/local/bin/kit-verify --tier "${KIT_TIER:-care}" >/dev/null
+    issue_token "$state" /activate 48
+    open_page
+    systemctl enable --now hermes-kit-activation-expiry.timer
+    ;;
+  home)
+    issue_token "$home" /home 2
+    open_page
+    systemctl enable --now hermes-kit-activation-expiry.timer
+    cat "$home/handoff-url"
+    ;;
+  close)
+    rm -f "$state/handoff-url" "$state/token.sha256" "$state/salt"
+    if [[ ! -f $home/token.sha256 && ! -f $support/token.sha256 ]]; then close_443; fi
+    ;;
+  expire)
+    now=$(date -u +%s)
+    for directory in "$state" "$support" "$home"; do
+      [[ -f $directory/expires-at ]] || continue
+      expires=$(<"$directory/expires-at")
+      if [[ $expires =~ ^[0-9]+$ ]] && (( expires <= now )); then
+        rm -f "$directory/handoff-url" "$directory/token.sha256" "$directory/salt"
+        if [[ $directory == "$support" && -f $support/grant-id ]]; then /usr/local/bin/kit-revoke-access "$(<"$support/grant-id")" || true; rm -f "$support/grant-id"; fi
+      fi
+    done
+    if [[ ! -f $state/token.sha256 && ! -f $home/token.sha256 && ! -f $support/token.sha256 ]]; then close_443; fi
+    ;;
+  open-support)
+    hours=${2:-}; [[ $hours =~ ^(1|2|8|24)$ ]] || usage
+    [[ -n ${OPS_SSH_PUBKEY:-} ]] || { echo 'No client-approved support public key is configured.' >&2; exit 1; }
+    issue_token "$support" /support "$hours"
+    key_file=$(mktemp /run/hermes-kit-support-key.XXXXXX); trap 'rm -f "$key_file"' EXIT
+    printf '%s\n' "$OPS_SSH_PUBKEY" > "$key_file"; chmod 0600 "$key_file"
+    grant_output=$(printf 'GRANT\n' | /usr/local/bin/kit-grant-access --public-key "$key_file" --hours "$hours" --waiver support-page)
+    grant_id=$(awk '/^Grant ID:/ {print $3}' <<<"$grant_output")
+    [[ $grant_id =~ ^grant-[A-Za-z0-9._-]+$ ]] || { echo 'Support grant was not issued.' >&2; exit 1; }
+    printf '%s\n' "$grant_id" > "$support/grant-id"; chmod 0600 "$support/grant-id"
+    open_page
+    systemctl enable --now hermes-kit-support-expiry.timer
+    cat "$support/handoff-url"
+    ;;
+  revoke-support)
+    if [[ -f $support/grant-id ]]; then /usr/local/bin/kit-revoke-access "$(<"$support/grant-id")" || true; fi
+    rm -f "$support/handoff-url" "$support/token.sha256" "$support/salt" "$support/grant-id"
+    if [[ ! -f $home/token.sha256 && ! -f $state/token.sha256 ]]; then close_443; fi
+    systemctl disable --now hermes-kit-support-expiry.timer 2>/dev/null || true
+    ;;
+  *) usage ;;
+esac

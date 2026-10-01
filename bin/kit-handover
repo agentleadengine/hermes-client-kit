@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+kit_dir=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=../lib/sshd-transaction.sh
+source "$kit_dir/lib/sshd-transaction.sh"
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-handover must run as root with the client present.' >&2; exit 1; }
+read -r -p 'Confirm the client has independent access. Type HANDOVER: ' confirmation
+[[ $confirmation == HANDOVER ]] || { echo 'Handover cancelled.' >&2; exit 1; }
+for certificate in /var/lib/hermes-kit/grants/*-cert.pub; do
+  [[ -e $certificate ]] || continue
+  grant_id=${certificate##*/}
+  grant_id=${grant_id%-cert.pub}
+  "$(dirname "$(readlink -f "$0")")/kit-revoke-access" "$grant_id"
+done
+loginctl terminate-user hermes-ops || true
+rm -f /etc/sudoers.d/90-hermes-kit-ops /etc/sudoers.d/90-hermes-kit-hermes-ops /etc/ssh/auth_principals/hermes-ops
+if id -u hermes-ops >/dev/null 2>&1; then
+  userdel --remove hermes-ops
+  ! id -u hermes-ops >/dev/null 2>&1 || { echo 'Could not remove exceptional operator account.' >&2; exit 1; }
+fi
+if id -u ops >/dev/null 2>&1; then
+  loginctl terminate-user ops || true
+  userdel --remove ops
+  ! id -u ops >/dev/null 2>&1 || { echo 'Could not remove legacy operator account.' >&2; exit 1; }
+fi
+sshd_file_apply /etc/ssh/sshd_config.d/10-hermes-kit-access.conf
+systemctl disable --now hermes-kit-grant-cleanup.timer 2>/dev/null || true
+sshd -t
+systemctl reload ssh || systemctl restart ssh.socket
+printf '%s handover-complete no-ops-account=no-ops-principal=no-active-cert-required=no\n' "$(date -u +%FT%TZ)" >> /var/lib/hermes-kit/access-events.log
+"$(dirname "$(readlink -f "$0")")/kit-verify" --tier care
+echo 'Handover proof: no operator account, sudoers grant, accepted ops principal, or active grant timer remains.'

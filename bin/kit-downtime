@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${EUID} -eq 0 ]] || { echo 'kit-downtime must run as root.' >&2; exit 1; }
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
+# shellcheck source=../lib/report-common.sh
+source "$kit_dir/lib/report-common.sh"
+file=${KIT_DOWNTIME_FILE:-/var/lib/hermes-kit/downtime.json}
+case ${1:-} in
+  set) if [[ $# -ne 2 ]] || ! report_valid_timestamp "$2" || (( $(report_epoch "$2") <= $(date -u +%s) )); then echo 'Usage: kit-downtime set YYYY-MM-DDTHH:MM:SSZ (future UTC)' >&2; exit 2; fi; until=$2 ;;
+  clear) [[ $# -eq 1 ]] || exit 2; until=none ;;
+  *) echo 'Usage: kit-downtime set <until>|clear' >&2; exit 2 ;;
+esac
+install -d -m 0751 "$(dirname "$file")"
+tmp=$(mktemp "$(dirname "$file")/.downtime.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+jq -n --arg until "$until" '{planned_downtime_until:$until}' > "$tmp"
+install -o root -g root -m 0600 "$tmp" "$file"

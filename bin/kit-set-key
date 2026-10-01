@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+key=${1:-}
+env_file=/home/hermes/.hermes/profiles/client/.env
+kit_dir="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$kit_dir/lib/common.sh"
+
+if [[ ${EUID} -ne 0 ]]; then
+  echo 'kit-set-key must run as root.' >&2
+  exit 1
+fi
+if [[ ! $key =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+  echo 'Usage: kit-set-key UPPER_SNAKE_CASE_KEY' >&2
+  exit 1
+fi
+if [[ $key == GATEWAY_ALLOW_ALL_USERS || $key == *_ALLOW_ALL_USERS ]]; then
+  echo 'Allow-all messaging keys are forbidden. Configure the selected platform allowlist instead.' >&2
+  exit 1
+fi
+if [[ $key =~ ^(GMAIL|GOOGLE|OUTLOOK|IMAP|SMTP|EMAIL)_ ]]; then
+  echo 'Client-mailbox OAuth, IMAP, SMTP, and email gateway credentials are forbidden. Use the agent inbox AGENTMAIL_API_KEY only.' >&2
+  exit 1
+fi
+if [[ $key == OPENCODE_GO_API_KEY ]]; then
+  cat >&2 <<'EOF'
+OpenCode Go consent required
+Routing: prompts, completions, and request/session metadata go through the Go
+gateway to the selected upstream model. The reviewed Go materials do not make
+the US-hosting statement that Zen makes for its route.
+Retention: listed Go models vary. Some are 0 days; Grok and GPT entries list
+30 days. Training: most listed models say no, while model-specific terms can
+change. Review DATA-MAP.md before choosing this provider.
+EOF
+  read -r -p 'Type exactly "I understand OpenCode Go data handling" to continue: ' go_ack
+  [[ $go_ack == 'I understand OpenCode Go data handling' ]] || { echo 'OpenCode Go credential was not stored.' >&2; exit 1; }
+  ledger=/etc/hermes-kit/consents.json
+  install -d -m 0700 /etc/hermes-kit
+  [[ -f $ledger ]] || printf '{"consents":[]}\n' > "$ledger"
+  tmp=$(mktemp "$ledger.XXXXXX")
+  jq --arg date "$(date -u +%F)" --arg acknowledgement "$go_ack" '.consents = ((.consents // []) | map(select(.integration != "opencode-go")) + [{client_name:"client",date:$date,integration:"opencode-go",scopes:["model prompts, completions, request/session metadata"],risk_level:"YELLOW",warnings_shown:"OpenCode Go routing, retention, and training warning",confirmation:$acknowledgement}])' "$ledger" > "$tmp"
+  chown root:root "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+fi
+
+read -r -s -p "Value for $key: " value
+printf '\n'
+[[ -n $value && $value != *$'\n'* && $value != *$'\r'* ]] || { echo 'A non-empty one-line value is required.' >&2; exit 1; }
+if [[ $key == *_ALLOWED_USERS ]] && ! validate_explicit_allowlist "$value"; then
+  echo 'Wildcard allowlists are forbidden. List each authorized user explicitly.' >&2
+  exit 1
+fi
+
+forbid_allow_all_key "$key" || { echo 'Allow-all messaging keys are forbidden. Configure the selected platform allowlist instead.' >&2; exit 1; }
+set_env_value "$key" "$value" "$env_file"
+systemctl try-restart hermes-gateway.service
+echo "Stored $key for hermes."

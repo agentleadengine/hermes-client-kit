@@ -1,0 +1,57 @@
+#cloud-config
+# Replace these values in the release artifact before provisioning.
+# Use an immutable tag, never a branch.
+# KIT_REPO_URL: https://github.com/your-org/hermes-client-kit.git
+# KIT_GIT_REF: v1.0.0
+write_files:
+  - path: /etc/hermes-kit/bootstrap.env
+    permissions: '0600'
+    content: |
+      KIT_REPO_URL="REPLACE_WITH_RELEASE_REPOSITORY_URL"
+      KIT_GIT_REF="REPLACE_WITH_IMMUTABLE_RELEASE_TAG"
+  - path: /etc/hermes-kit/kit.conf
+    permissions: '0600'
+    content: |
+      CLIENT_NAME=""
+      # Care tier has no standing operator key.
+      OPS_SSH_PUBKEY=""
+      MODEL_PROVIDER="opencode-zen"
+      MODEL_NAME=""
+      MESSAGING_PLATFORM="none"
+      TELEGRAM_ALLOWED_USERS=""
+      # Required release pins. The provisioning web app replaces both values.
+      HERMES_COMMIT="REPLACE_WITH_REVIEWED_FULL_COMMIT_SHA"
+      SEARXNG_IMAGE="docker.io/searxng/searxng@sha256:REPLACE_WITH_REVIEWED_DIGEST"
+      ENABLE_HINDSIGHT="false"
+      HINDSIGHT_LLM_PROVIDER="openai_compatible"
+      HINDSIGHT_LLM_MODEL=""
+      HINDSIGHT_LLM_BASE_URL=""
+  - path: /etc/systemd/system/hermes-kit-install-retry.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Install Hermes Client Kit with bounded first-boot retries
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/hermes-client-kit/bin/kit-install-retry
+      TimeoutStartSec=0
+  - path: /etc/systemd/system/hermes-kit-install-retry.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Retry failed Hermes Kit first-boot installation
+
+      [Timer]
+      OnBootSec=10m
+      OnUnitInactiveSec=10m
+      Unit=hermes-kit-install-retry.service
+
+      [Install]
+      WantedBy=timers.target
+runcmd:
+  - [bash, -lc, 'DEBIAN_FRONTEND=noninteractive apt-get update && apt-get -y --no-install-recommends install git curl jq openssl']
+  - [mkdir, -p, /opt/hermes-client-kit]
+  - [bash, -lc, 'source /etc/hermes-kit/bootstrap.env && test "$KIT_REPO_URL" != "REPLACE_WITH_RELEASE_REPOSITORY_URL" && test "$KIT_GIT_REF" != "REPLACE_WITH_IMMUTABLE_RELEASE_TAG" && git clone --branch "$KIT_GIT_REF" --depth 1 "$KIT_REPO_URL" /opt/hermes-client-kit && systemctl daemon-reload && systemctl enable --now hermes-kit-install-retry.timer && systemctl start hermes-kit-install-retry.service']

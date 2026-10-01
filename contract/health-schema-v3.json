@@ -1,0 +1,453 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "agent-care/health-schema-v3.json",
+ "title": "Agent Care health report v3",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "schema": {
+   "const": 3
+  },
+  "generated_at": {
+   "type": "string",
+   "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+  },
+  "status": {
+   "enum": [
+    "healthy",
+    "degraded",
+    "unavailable"
+   ]
+  },
+  "agent_id": {
+   "type": "string",
+   "pattern": "^A[0-9]{2,4}$"
+  },
+  "tier": {
+   "enum": [
+    "care",
+    "managed",
+    "full"
+   ]
+  },
+  "hermes": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "pinned_commit": {
+     "type": "string",
+     "pattern": "^([0-9a-fA-F]{7,40}|unknown)$"
+    },
+    "installed_commit": {
+     "type": "string",
+     "pattern": "^([0-9a-fA-F]{7,40}|unknown)$"
+    }
+   },
+   "required": [
+    "pinned_commit",
+    "installed_commit"
+   ]
+  },
+  "services": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "client_gateway": {
+     "enum": [
+      "active",
+      "inactive",
+      "failed",
+      "activating",
+      "deactivating",
+      "unknown",
+      "disabled"
+     ]
+    },
+    "support_gateway": {
+     "enum": [
+      "active",
+      "inactive",
+      "failed",
+      "activating",
+      "deactivating",
+      "unknown",
+      "disabled"
+     ]
+    },
+    "client_restarts": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "support_restarts": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "required": [
+    "client_gateway",
+    "support_gateway",
+    "client_restarts",
+    "support_restarts"
+   ]
+  },
+  "platform": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "enum": [
+      "none",
+      "photon",
+      "telegram",
+      "whatsapp",
+      "signal",
+      "slack",
+      "agentmail"
+     ]
+    },
+    "status": {
+     "enum": [
+      "active",
+      "inactive",
+      "failed",
+      "activating",
+      "deactivating",
+      "unknown",
+      "disabled"
+     ]
+    }
+   },
+   "required": [
+    "name",
+    "status"
+   ]
+  },
+  "resources": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "disk_total_blocks": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "disk_used_blocks": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "memory_total_kib": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "memory_available_kib": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "load": {
+     "type": "array",
+     "minItems": 3,
+     "maxItems": 3,
+     "items": {
+      "type": "number",
+      "minimum": 0
+     }
+    }
+   },
+   "required": [
+    "disk_total_blocks",
+    "disk_used_blocks",
+    "memory_total_kib",
+    "memory_available_kib",
+    "load"
+   ]
+  },
+  "verify": {
+   "type": "array",
+   "maxItems": 100,
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "status": {
+      "enum": [
+       "PASS",
+       "FAIL"
+      ]
+     },
+     "id": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{2,95}$"
+     }
+    },
+    "required": [
+     "status",
+     "id"
+    ]
+   }
+  },
+  "error_counts": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "auth_failed": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "rate_limited": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "timeout": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "network_error": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "provider_error": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "quota": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "required": []
+  },
+  "integration_names": {
+   "type": "array",
+   "maxItems": 50,
+   "uniqueItems": true,
+   "items": {
+    "enum": [
+     "agentmail",
+     "opencode-zen",
+     "opencode-go",
+     "ollama-cloud",
+     "openrouter",
+     "photon",
+     "telegram",
+     "whatsapp",
+     "signal",
+     "slack",
+     "notion",
+     "google-workspace",
+     "github",
+     "dropbox",
+     "box",
+     "linear",
+     "cloudflare"
+    ]
+   }
+  },
+  "cron": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "heartbeat_age_seconds": {
+     "type": "integer",
+     "minimum": -1
+    }
+   },
+   "required": [
+    "heartbeat_age_seconds"
+   ]
+  },
+  "last_model_call": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "epoch": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "age_seconds": {
+     "type": "integer",
+     "minimum": -1
+    }
+   },
+   "required": [
+    "epoch",
+    "age_seconds"
+   ]
+  },
+  "update": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "status": {
+     "enum": [
+      "applied",
+      "failed",
+      "paused",
+      "unknown",
+      "rolled_back",
+      "held"
+     ]
+    },
+    "sequence": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "at": {
+     "anyOf": [
+      {
+       "type": "string",
+       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+      },
+      {
+       "const": "unknown"
+      }
+     ]
+    }
+   },
+   "required": [
+    "status",
+    "sequence",
+    "at"
+   ]
+  },
+  "handover_done": {
+   "type": "boolean"
+  },
+  "going_down": {
+   "type": "boolean"
+  },
+  "planned_downtime_until": {
+   "anyOf": [
+    {
+     "type": "string",
+     "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    {
+     "const": "none"
+    }
+   ]
+  },
+  "power_ups": {
+   "type": "array",
+   "uniqueItems": true,
+   "maxItems": 5,
+   "items": {
+    "enum": [
+     "base",
+     "builder",
+     "website",
+     "logins",
+     "schedules"
+    ]
+   }
+  },
+  "tools": {
+   "type": "array",
+   "maxItems": 20,
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,31}$"
+     },
+     "up": {
+      "type": "boolean"
+     },
+     "version": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z._-]{1,40}$"
+     },
+     "last_backup_ok_hours": {
+      "type": "number",
+      "minimum": 0
+     },
+     "tests_ok": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "name",
+     "up",
+     "version",
+     "last_backup_ok_hours",
+     "tests_ok"
+    ]
+   }
+  },
+  "access": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "manager_key_present": {
+     "type": "boolean"
+    },
+    "full_access_active": {
+     "type": "boolean"
+    },
+    "grants_active": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "grant_expires_at": {
+     "anyOf": [
+      {
+       "type": "string",
+       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+      },
+      {
+       "const": "none"
+      }
+     ]
+    },
+    "team_key_fingerprints": {
+     "type": "array",
+     "items": {"type": "string", "pattern": "^SHA256:[A-Za-z0-9+/=]{32,64}$"},
+     "uniqueItems": true
+    }
+   },
+   "required": [
+    "manager_key_present",
+    "full_access_active",
+    "grants_active",
+    "grant_expires_at"
+   ]
+  },
+  "push": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "failures_since_last_ok": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "required": [
+    "failures_since_last_ok"
+   ]
+  }
+ },
+ "required": [
+  "schema",
+  "generated_at",
+  "status",
+  "agent_id",
+  "tier",
+  "hermes",
+  "services",
+  "platform",
+  "resources",
+  "verify",
+  "error_counts",
+  "integration_names",
+  "cron",
+  "last_model_call",
+  "update",
+  "handover_done",
+  "going_down",
+  "planned_downtime_until",
+  "power_ups",
+  "tools",
+  "access",
+  "push"
+ ]
+}

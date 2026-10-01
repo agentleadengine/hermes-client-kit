@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+dry_run=false
+[[ ${1:-} == --dry-run ]] && dry_run=true
+[[ $# -le 1 ]] || { echo 'Usage: kit-lockdown [--dry-run]' >&2; exit 1; }
+[[ ${EUID} -eq 0 ]] || { echo 'kit-lockdown must run as root.' >&2; exit 1; }
+
+run() { if [[ $dry_run == true ]]; then printf 'DRY-RUN %q ' "$@"; printf '\n'; else "$@" || { printf 'WARN containment command failed: %q\n' "$1" >&2; return 0; }; fi; }
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+snapshot=/root/hermes-kit-lockdown/hermes-state-$stamp.tgz
+
+hermes_uid=$(id -u hermes)
+run systemctl stop hermes-gateway.service
+for tool_unit in /etc/systemd/system/hermes-kit-tool-*.service; do
+  [[ -f $tool_unit ]] || continue
+  run systemctl stop "$(basename "$tool_unit")"
+done
+run systemctl stop hermes-kit-cloudflared.service hermes-kit-logins-browser.service hermes-kit-logins-proxy.service hermes-kit-website-preview.service
+run runuser -u hermes -- env XDG_RUNTIME_DIR="/run/user/$hermes_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$hermes_uid/bus" systemctl --user stop hermes-dashboard.service searxng.service hermes-mailroom-fetch.service hermes-mailroom-fetch.timer
+run systemctl stop syncthing@hermes.service
+run runuser -u hermes -- env DOCKER_HOST="unix:///run/user/$hermes_uid/docker.sock" sh -c 'docker ps -aq | xargs -r docker stop'
+if [[ $dry_run == true ]] || ! iptables -C OUTPUT -m owner --uid-owner hermes -j REJECT 2>/dev/null; then run iptables -I OUTPUT -m owner --uid-owner hermes -j REJECT; fi
+if [[ $dry_run == true ]] || ! ip6tables -C OUTPUT -m owner --uid-owner hermes -j REJECT 2>/dev/null; then run ip6tables -I OUTPUT -m owner --uid-owner hermes -j REJECT; fi
+run install -d -m 0700 /root/hermes-kit-lockdown
+run tar --ignore-failed-read -C / -czf "$snapshot" var/log/hermes-kit.log var/log/auth.log home/hermes/.hermes
+run chmod 0400 "$snapshot"
+
+cat <<'EOF'
+Lockdown complete. Rotate, with the client present:
+1. OpenCode and all model-provider credentials.
+2. AgentMail inbox-scoped key and messaging tokens.
+3. Photon and Hindsight credentials, if configured.
+4. Any approved integration credentials, then review the consent ledger.
+5. Inspect the read-only snapshot and decide whether incident response or offboarding is required.
+EOF

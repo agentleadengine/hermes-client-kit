@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ledger=/etc/hermes-kit/consents.json
+command=${1:-}
+integration=${2:-}
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-consent must run as root with the client present.' >&2; exit 1; }
+install -d -m 0700 /etc/hermes-kit
+[[ -f $ledger ]] || printf '{"consents":[]}\n' > "$ledger"
+chown root:root "$ledger"
+chmod 0600 "$ledger"
+
+case $command in
+  list)
+    jq -r '.consents[] | [.date, .client_name, .integration, .risk_level, (.scopes | join(", "))] | @tsv' "$ledger"
+    ;;
+  add)
+    [[ -n $integration && $integration =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'Usage: kit-consent add <integration>' >&2; exit 1; }
+    read -r -p 'Client name: ' client_name
+    read -r -p 'Scopes, comma-separated: ' scopes_raw
+    read -r -p 'Risk level (GREEN, YELLOW, RED): ' risk_level
+    risk_level=${risk_level^^}
+    [[ -n $client_name && -n $scopes_raw && $risk_level =~ ^(GREEN|YELLOW|RED)$ ]] || { echo 'Client name, scopes, and a valid risk level are required.' >&2; exit 1; }
+    case $risk_level in
+      GREEN) warning='Low impact, but the integration can still expose the selected data.' ;;
+      YELLOW) warning='This can expose sensitive business data or make reversible changes. Use least privilege.' ;;
+      RED) warning='This can send as the client, move money, delete, or publish. Every RED action still needs per-action approval.' ;;
+    esac
+    printf '%s\n' "$warning"
+    read -r -p 'Type exactly "I understand" to record consent: ' confirmation
+    [[ $confirmation == 'I understand' ]] || { echo 'Consent not recorded.' >&2; exit 1; }
+    scopes_json=$(printf '%s' "$scopes_raw" | jq -Rc 'split(",") | map(gsub("^ +| +$"; "")) | map(select(length > 0))')
+    tmp=$(mktemp "$ledger.XXXXXX")
+    jq --arg client_name "$client_name" --arg date "$(date -u +%F)" --arg integration "$integration" --arg risk_level "$risk_level" --arg warning "$warning" --arg confirmation "$confirmation" --argjson scopes "$scopes_json" \
+      '.consents = ((.consents // []) | map(select(.integration != $integration)) + [{client_name: $client_name, date: $date, integration: $integration, scopes: $scopes, risk_level: $risk_level, warnings_shown: $warning, confirmation: $confirmation}])' "$ledger" > "$tmp"
+    chown root:root "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+    echo "Recorded consent for $integration."
+    ;;
+  remove)
+    [[ -n $integration ]] || { echo 'Usage: kit-consent remove <integration>' >&2; exit 1; }
+    tmp=$(mktemp "$ledger.XXXXXX")
+    jq --arg integration "$integration" '.consents = ((.consents // []) | map(select(.integration != $integration)))' "$ledger" > "$tmp"
+    chown root:root "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+    echo "Removed consent for $integration. Disconnect the integration and remove its credential before verification."
+    ;;
+  *) echo 'Usage: kit-consent add|list|remove <integration>' >&2; exit 1 ;;
+esac

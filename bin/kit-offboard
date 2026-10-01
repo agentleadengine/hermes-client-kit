@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-offboard must run as root.' >&2; exit 1; }
+echo 'kit-offboard is superseded by the zero-access handover flow.'
+exec "$(dirname "$(readlink -f "$0")")/kit-handover"
+config_file=${KIT_CONFIG:-/etc/hermes-kit/kit.conf}
+[[ -f $config_file ]] || { echo "Missing kit configuration: $config_file" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$config_file"
+[[ -n ${OPS_SSH_PUBKEY:-} ]] || { echo 'OPS_SSH_PUBKEY is required to revoke the operator key.' >&2; exit 1; }
+
+ops_keys=/home/ops/.ssh/authorized_keys
+if [[ -f $ops_keys ]]; then
+  ops_keys_temp=$(mktemp "$ops_keys.XXXXXX")
+  grep -vxF "$OPS_SSH_PUBKEY" "$ops_keys" > "$ops_keys_temp" || true
+  chown ops:ops "$ops_keys_temp"
+  chmod 0600 "$ops_keys_temp"
+  mv "$ops_keys_temp" "$ops_keys"
+fi
+rm -f /etc/sudoers.d/90-hermes-kit-ops
+install -d -m 0700 /root/hermes-kit-handover
+handover=/root/hermes-kit-handover/README.txt
+install -m 0600 /dev/stdin "$handover" <<'EOF'
+Hermes client handover
+
+1. Confirm the client can log in with their own SSH key.
+2. Rotate model and Telegram credentials if the operator ever saw them.
+3. Pair Syncthing with the client's device through its loopback GUI over SSH forwarding.
+4. Keep /home/hermes/vault and /home/hermes/.hermes/profiles/client owned by hermes.
+5. Review /etc/hermes-kit/kit.conf and remove operator-only notes.
+6. The operator's sudo grant and configured SSH key have been removed. The ops account remains so this SSH session is not terminated.
+7. After confirming independent client access and closing this ops SSH session, remove the account if the client requests it:
+   userdel --remove ops
+8. Revoke the operator's cloud-account role and temporary provisioning tokens.
+EOF
+echo 'Removed the ops sudo grant and configured SSH key. The ops account remains for this live SSH session.'
+echo "Handover checklist written to $handover"

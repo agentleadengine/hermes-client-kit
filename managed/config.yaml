@@ -1,0 +1,22 @@
+# Template. install.sh writes a client-specific copy to /etc/hermes/config.yaml.
+model:
+  provider: opencode-go
+gateway:
+  multiplex_profiles: true
+  allow_all_users: false
+security:
+  redact_secrets: true
+  tirith_enabled: true
+  tirith_fail_open: false
+terminal:
+  backend: docker
+  docker_network: false
+approvals:
+  mode: manual
+  denial_breaker_threshold: 3
+  deny:
+    - "git push --force*"
+    - "*curl*|*sh*"
+    - "dd if=* of=/dev/*"
+updates:
+  pre_update_backup: full

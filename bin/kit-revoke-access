@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+kit_dir=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=../lib/sshd-transaction.sh
+source "$kit_dir/lib/sshd-transaction.sh"
+
+[[ ${EUID} -eq 0 ]] || { echo 'kit-revoke-access must run as root.' >&2; exit 1; }
+grant_id=${1:-}
+[[ $grant_id =~ ^grant-[A-Za-z0-9._-]+$ ]] || { echo 'Usage: kit-revoke-access GRANT_ID' >&2; exit 2; }
+certificate="/var/lib/hermes-kit/grants/$grant_id-cert.pub"
+[[ -f $certificate ]] || { echo 'Unknown grant.' >&2; exit 1; }
+# ssh-keygen -Q exits zero for an unrevoked key.  A revoked key must make the
+# query fail, so invert the probe both before and after updating the KRL.
+if ssh-keygen -Q -f /etc/ssh/kit/revoked.krl "$certificate" >/dev/null 2>&1; then
+  staged_krl=$(mktemp)
+  cp /etc/ssh/kit/revoked.krl "$staged_krl"
+  ssh-keygen -k -u -f "$staged_krl" "$certificate"
+  if ! sshd_file_apply /etc/ssh/kit/revoked.krl "$staged_krl"; then
+    rm -f "$staged_krl"
+    exit 1
+  fi
+  rm -f "$staged_krl"
+fi
+if ssh-keygen -Q -f /etc/ssh/kit/revoked.krl "$certificate" >/dev/null 2>&1; then
+  echo 'Certificate was not recorded as revoked.' >&2
+  exit 1
+fi
+loginctl terminate-user hermes-ops || true
+sshd -t
+systemctl reload ssh || systemctl restart ssh.socket
+printf '%s grant-revoked id=%s\n' "$(date -u +%FT%TZ)" "$grant_id" >> /var/lib/hermes-kit/access-events.log
+rm -f "$certificate" "/run/hermes-kit/grants/$grant_id-cert.pub" "/run/hermes-kit/grants/$grant_id.pub"
+echo "Revoked $grant_id and terminated any live hermes-ops session."

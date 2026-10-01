@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+health_file=${KIT_HEALTH_OUTPUT_FILE:-/var/lib/hermes-kit/health.json}
+mode=${1:-}
+[[ $# -le 1 ]] || { echo 'Usage: kit-health [--explain|--redaction-test]' >&2; exit 2; }
+case $mode in ''|--explain|--redaction-test) ;; *) echo 'Usage: kit-health [--explain|--redaction-test]' >&2; exit 2 ;; esac
+[[ ${EUID} -eq 0 || ${KIT_HEALTH_TEST_MODE:-} == 1 ]] || { echo 'kit-health must run as root.' >&2; exit 1; }
+health_state_dir=${KIT_HEALTH_STATE_DIR:-/var/lib/hermes-kit}
+if [[ ${KIT_HEALTH_TEST_MODE:-} == 1 ]]; then [[ -n ${KIT_HEALTH_OUTPUT_FILE:-} && -n ${KIT_HEALTH_STATE_DIR:-} ]] || exit 2; mkdir -p "$health_state_dir"; fi
+
+service_state() {
+  local state
+  state=$(systemctl is-active "$1" 2>/dev/null || true)
+  case $state in active|inactive|failed|activating|deactivating) printf %s "$state" ;; *) printf unknown ;; esac
+}
+restart_count() { systemctl show "$1" -p NRestarts --value 2>/dev/null | tr -cd '0-9' | head -c 8 || true; }
+safe_commit() { [[ $1 =~ ^[0-9a-fA-F]{7,40}$ ]] && printf %s "$1" || printf unknown; }
+safe_integer() { [[ $1 =~ ^[0-9]+$ ]] && printf %s "$1" || printf 0; }
+
+if [[ $mode == --redaction-test ]]; then
+  test_dir=$(mktemp -d "$health_state_dir/health-redaction.XXXXXX")
+  trap 'rm -rf "$test_dir"' EXIT
+  sentinels=$'prompt-canary-7f3a\nemail-canary@example.invalid\nvault-canary-private.md\nmemory-canary-text\nsk-health-canary-1234567890\ntool-secret-canary\ngrant-secret-canary\ndowntime-secret-canary\npowerup-secret-canary\nmanager-secret-canary\nhandover-secret-canary\npush-secret-canary'
+  printf '%s\n' "$sentinels" > "$test_dir/journal"
+  printf '%s\n' '{"consents":[{"integration":"sk-health-canary-1234567890"}]}' > "$test_dir/consents.json"
+  printf '%s\n' '{"tools":[{"name":"tool-secret-canary!","up":true,"version":"bad","last_backup_ok_hours":0,"tests_ok":true}]}' > "$test_dir/tools.json"
+  printf '%s\n' '{"planned_downtime_until":"downtime-secret-canary"}' > "$test_dir/downtime.json"
+  printf '%s\n' $'1\tgrant-secret-canary\t2099-01-01T00:00:00Z\twaiver\tfingerprint' > "$test_dir/grants.tsv"
+  : > "$test_dir/grant-secret-canary-cert.pub"
+  printf '%s\n' 'manager-secret-canary' > "$test_dir/manager-key"
+  printf '%s\n' '2099-01-01T00:00:00Z handover-complete handover-secret-canary' > "$test_dir/access-events.log"
+  printf '%s\n' 'push-secret-canary' > "$test_dir/push-failures"
+  printf '%s\n' '{"consents":[{"integration":"powerup-secret-canary"}]}' > "$test_dir/consents.json"
+  printf '%s\n' '#!/usr/bin/env bash' "printf '%s\\n' '{\"checks\":[{\"status\":\"FAIL\",\"id\":\"prompt-canary-7f3a\"}]}'" > "$test_dir/verify"
+  chmod 0700 "$test_dir/verify"
+  export KIT_HEALTH_JOURNAL_FILE="$test_dir/journal" KIT_HEALTH_CONSENTS_FILE="$test_dir/consents.json" KIT_HEALTH_VERIFY_COMMAND="$test_dir/verify"
+  export KIT_HEALTH_TOOLS_FILE="$test_dir/tools.json" KIT_HEALTH_DOWNTIME_FILE="$test_dir/downtime.json" KIT_HEALTH_GRANTS_FILE="$test_dir/grants.tsv"
+  export KIT_HEALTH_GRANTS_DIR="$test_dir" KIT_HEALTH_MANAGER_KEY_FILE="$test_dir/manager-key" KIT_HEALTH_ACCESS_EVENTS_FILE="$test_dir/access-events.log" KIT_HEALTH_PUSH_FAILURES_FILE="$test_dir/push-failures"
+fi
+
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
+# shellcheck source=../lib/common.sh
+source "$kit_dir/lib/common.sh"
+[[ -f ${KIT_CONFIG:-/etc/hermes-kit/kit.conf} ]] && load_kit_config "${KIT_CONFIG:-/etc/hermes-kit/kit.conf}"
+agent_id=${KIT_AGENT_ID:-A00}
+[[ $agent_id =~ ^A[0-9]{2,4}$ ]] || agent_id=A00
+tier=${KIT_TIER:-care}
+[[ $tier == ludicrous ]] && tier=full
+[[ $tier =~ ^(care|managed|full)$ ]] || tier=care
+pinned=$(safe_commit "${HERMES_COMMIT:-}")
+installed=$(safe_commit "$(cat /etc/hermes-kit/hermes-commit 2>/dev/null || true)")
+script_dir=$(dirname -- "$script_path")
+verify_command=${KIT_HEALTH_VERIFY_COMMAND:-"$script_dir/kit-verify --json --tier ${KIT_TIER:-care}"}
+verify_result=$($verify_command 2>/dev/null || true)
+verify_valid=false
+if jq -e '(.checks | type == "array") and (.failures | type == "number") and (.warnings | type == "number") and all(.checks[]; (.status | IN("PASS","FAIL","WARN")) and (.id | type == "string" and test("^CHECK_[A-Z0-9_]{3,95}$")))' <<<"$verify_result" >/dev/null 2>&1; then
+  verify_valid=true
+  verify_ids=$(jq -c '[.checks[] | select(.status == "PASS" or .status == "FAIL") | {status,id}] | unique_by(.status + ":" + .id) | .[0:100]' <<<"$verify_result")
+else
+  verify_ids='[]'
+fi
+
+# Ledger labels are projected through a closed vocabulary. This prevents a
+# consent name from becoming a covert client-content or credential channel.
+consents_file=${KIT_HEALTH_CONSENTS_FILE:-/etc/hermes-kit/consents.json}
+known_integrations='["agentmail","opencode-zen","opencode-go","ollama-cloud","openrouter","photon","telegram","whatsapp","signal","slack","notion","google-workspace","github","dropbox","box","linear","cloudflare"]'
+integrations=$(jq -c --argjson known "$known_integrations" '[.consents[]?.integration | select(. as $item | type == "string" and ($known | index($item) != null))] | unique | .[0:50]' "$consents_file" 2>/dev/null || printf '[]')
+power_ups=$(jq -ce '([.consents[]?.integration | select(type == "string" and IN("builder","website","logins","schedules"))] | unique) as $optional | ["base"] + $optional' "$consents_file" 2>/dev/null || printf '["base"]')
+tools_file=${KIT_HEALTH_TOOLS_FILE:-/srv/tools/registry.json}
+tools=$(jq -c '[((if type == "array" then . else .tools // [] end)[]?) | select((.name | type == "string" and test("^[a-z][a-z0-9-]{1,31}$")) and (.up | type == "boolean") and (.version | type == "string" and test("^[0-9A-Za-z._-]{1,40}$")) and (.last_backup_ok_hours | type == "number" and . >= 0) and (.tests_ok | type == "boolean")) | {name,up,version,last_backup_ok_hours:(if (.last_backup_at | type) == "string" then (try (((now - (.last_backup_at | fromdateiso8601)) / 3600) | if . < 0 then 0 else . end) catch 999999) else .last_backup_ok_hours end),tests_ok}] | .[0:20]' "$tools_file" 2>/dev/null || printf '[]')
+handover_done=false
+if [[ -f ${KIT_HEALTH_ACCESS_EVENTS_FILE:-/var/lib/hermes-kit/access-events.log} ]] && grep -q ' handover-complete ' "${KIT_HEALTH_ACCESS_EVENTS_FILE:-/var/lib/hermes-kit/access-events.log}"; then handover_done=true; fi
+going_down=false
+planned_downtime_until=none
+downtime_file=${KIT_HEALTH_DOWNTIME_FILE:-/var/lib/hermes-kit/downtime.json}
+if [[ -f $downtime_file ]]; then
+  planned_downtime_until=$(jq -er '.planned_downtime_until | select(. == "none" or (type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))' "$downtime_file" 2>/dev/null || printf none)
+  [[ $(jq -r '.going_down // false' "$downtime_file" 2>/dev/null) == true ]] && going_down=true
+fi
+manager_key_present=false
+manager_key_file=${KIT_HEALTH_MANAGER_KEY_FILE:-/etc/hermes-kit/manager/authorized_keys}
+[[ -s $manager_key_file ]] && manager_key_present=true
+grants_file=${KIT_HEALTH_GRANTS_FILE:-/var/lib/hermes-kit/grants/ledger.tsv}
+grants_dir=${KIT_HEALTH_GRANTS_DIR:-/var/lib/hermes-kit/grants}
+grants_active=0 grant_expires_at=none latest_grant_epoch=0
+if [[ -f $grants_file ]]; then
+  while IFS=$'\t' read -r serial grant_id expires waiver fingerprint; do
+    [[ $serial =~ ^[1-9][0-9]*$ && $grant_id =~ ^grant-[A-Za-z0-9._-]+$ && -n $waiver && -n $fingerprint && -f $grants_dir/$grant_id-cert.pub ]] || continue
+    grant_epoch=$(date -u -d "$expires" +%s 2>/dev/null || printf 0)
+    [[ $grant_epoch =~ ^[0-9]+$ ]] || continue
+    if (( grant_epoch > $(date -u +%s) )); then
+      grants_active=$((grants_active + 1))
+      if (( grant_epoch > latest_grant_epoch )); then latest_grant_epoch=$grant_epoch; grant_expires_at=$expires; fi
+    fi
+  done < "$grants_file"
+fi
+full_access_active=false
+(( grants_active == 0 )) || full_access_active=true
+full_key_file=${KIT_HEALTH_FULL_KEY_FILE:-/etc/hermes-kit/full/authorized_keys}
+if [[ -s $full_key_file ]]; then
+  full_access_active=true
+  while IFS= read -r full_key; do [[ -n $full_key ]] && grants_active=$((grants_active + 1)); done < "$full_key_file"
+fi
+team_fingerprints='[]'
+for team_key_file in "$manager_key_file" "$full_key_file"; do
+  [[ -f $team_key_file ]] || continue
+  while IFS= read -r team_key || [[ -n $team_key ]]; do
+    if [[ $team_key =~ (ssh-ed25519|sk-ssh-ed25519@openssh.com)[[:space:]]+([A-Za-z0-9+/=]+) ]]; then
+      team_fingerprint=$(printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" | ssh-keygen -lf /dev/stdin 2>/dev/null | awk '{print $2}')
+      if [[ $team_fingerprint =~ ^SHA256:[A-Za-z0-9+/=]{32,64}$ ]]; then
+        team_fingerprints=$(jq -cn --argjson known "$team_fingerprints" --arg fingerprint "$team_fingerprint" '$known + [$fingerprint] | unique')
+      fi
+    fi
+  done < "$team_key_file"
+done
+access=$(jq -nc --argjson manager_key_present "$manager_key_present" --argjson full_access_active "$full_access_active" --argjson grants_active "$grants_active" --arg grant_expires_at "$grant_expires_at" --argjson team_key_fingerprints "$team_fingerprints" '{manager_key_present:$manager_key_present,full_access_active:$full_access_active,grants_active:$grants_active,grant_expires_at:$grant_expires_at,team_key_fingerprints:$team_key_fingerprints}')
+push_failures=$(cat "${KIT_HEALTH_PUSH_FAILURES_FILE:-/var/lib/hermes-kit/report/failures_since_last_ok}" 2>/dev/null || printf 0)
+push_failures=$(safe_integer "$push_failures")
+
+journal_source=${KIT_HEALTH_JOURNAL_FILE:-}
+if [[ -n $journal_source ]]; then journal_text=$(tail -n 400 "$journal_source" 2>/dev/null || true); else journal_text=$(journalctl -n 400 --no-pager -o cat 2>/dev/null || true); fi
+read -r auth_failed rate_limited timeout_count network_error provider_error quota < <(awk '/auth_failed/{a++} /rate_limited/{b++} /timeout/{c++} /network_error/{d++} /provider_error/{e++} /quota/{f++} END {print a+0,b+0,c+0,d+0,e+0,f+0}' <<<"$journal_text")
+errors=$(jq -n --argjson auth_failed "$(safe_integer "${auth_failed:-0}")" --argjson rate_limited "$(safe_integer "${rate_limited:-0}")" --argjson timeout "$(safe_integer "${timeout_count:-0}")" --argjson network_error "$(safe_integer "${network_error:-0}")" --argjson provider_error "$(safe_integer "${provider_error:-0}")" --argjson quota "$(safe_integer "${quota:-0}")" '{auth_failed:$auth_failed,rate_limited:$rate_limited,timeout:$timeout,network_error:$network_error,provider_error:$provider_error,quota:$quota}')
+
+read -r disk_total disk_used < <(df -P "$health_state_dir" | awk 'NR==2 {print $2,$3}')
+if [[ -r /proc/meminfo ]]; then
+  read -r mem_total mem_available < <(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {print t+0,a+0}' /proc/meminfo)
+else
+  mem_total=0 mem_available=0
+fi
+load_source=${KIT_HEALTH_LOADAVG_FILE:-/proc/loadavg}
+read -r load1 load5 load15 <<<"$(awk '{print $1,$2,$3}' "$load_source" 2>/dev/null || printf '0 0 0')"
+
+now=$(date -u +%s)
+cron_file=/home/hermes/.hermes/profiles/client/runtime/cron.heartbeat
+cron_age=-1
+[[ -f $cron_file ]] && cron_age=$(( now - $(stat -c %Y "$cron_file") ))
+model_epoch=0
+model_file=/var/lib/hermes-kit/model-last-success.epoch
+if [[ -f $model_file ]] && [[ $(<"$model_file") =~ ^[0-9]{10}$ ]]; then model_epoch=$(<"$model_file"); fi
+model_age=-1
+(( model_epoch > 0 && model_epoch <= now )) && model_age=$(( now - model_epoch ))
+
+update_status=unknown update_sequence=0 update_at=unknown
+if [[ -f /var/lib/hermes-kit/autoupdate/outcome.json ]]; then
+  update_status=$(jq -r '.status | select(IN("applied","failed","paused","unknown","rolled_back","held"))' /var/lib/hermes-kit/autoupdate/outcome.json 2>/dev/null || printf unknown)
+  update_sequence=$(safe_integer "$(jq -r '.sequence // 0' /var/lib/hermes-kit/autoupdate/outcome.json 2>/dev/null || printf 0)")
+  update_at=$(jq -r '.at | select(type == "string" and test("^[0-9TZ:-]{20}$"))' /var/lib/hermes-kit/autoupdate/outcome.json 2>/dev/null || printf unknown)
+fi
+platform=${MESSAGING_PLATFORM:-none}
+[[ $platform =~ ^(none|photon|telegram|whatsapp|signal|slack|agentmail)$ ]] || platform=none
+platform_state=disabled
+[[ $platform != none ]] && platform_state=$(service_state hermes-gateway.service)
+status=healthy
+if [[ $verify_valid != true ]]; then
+  status=unavailable
+elif [[ $verify_ids == *'"status":"FAIL"'* || $platform_state == failed ]]; then
+  status=degraded
+fi
+
+if [[ ${KIT_HEALTH_TEST_MODE:-} != 1 ]]; then install -d -m 0751 -o root -g root "$health_state_dir"; fi
+tmp=$(mktemp "$health_state_dir/.health.json.XXXXXX")
+jq -n \
+  --arg generated_at "$(date -u +%FT%TZ)" --arg status "$status" --arg agent_id "$agent_id" --arg tier "$tier" --arg pinned "$pinned" --arg installed "$installed" \
+  --arg client_gateway "$(service_state hermes-gateway.service)" --arg support_gateway "$(service_state hermes-support-gateway.service)" \
+  --arg platform "$platform" --arg platform_state "$platform_state" --arg update_status "$update_status" --arg update_at "$update_at" \
+  --argjson client_restarts "$(safe_integer "$(restart_count hermes-gateway.service)")" --argjson support_restarts "$(safe_integer "$(restart_count hermes-support-gateway.service)")" \
+  --argjson disk_total "$(safe_integer "${disk_total:-0}")" --argjson disk_used "$(safe_integer "${disk_used:-0}")" --argjson memory_total_kib "$(safe_integer "${mem_total:-0}")" --argjson memory_available_kib "$(safe_integer "${mem_available:-0}")" \
+  --argjson load1 "$load1" --argjson load5 "$load5" --argjson load15 "$load15" --argjson verify "$verify_ids" --argjson errors "$errors" --argjson integrations "$integrations" \
+  --argjson cron_age "$cron_age" --argjson model_epoch "$model_epoch" --argjson model_age "$model_age" --argjson update_sequence "$update_sequence" \
+  --argjson handover_done "$handover_done" --argjson going_down "$going_down" --arg planned_downtime_until "$planned_downtime_until" --argjson power_ups "$power_ups" --argjson tools "$tools" --argjson access "$access" --argjson push_failures "$push_failures" \
+  '{schema:3,generated_at:$generated_at,status:$status,agent_id:$agent_id,tier:$tier,hermes:{pinned_commit:$pinned,installed_commit:$installed},services:{client_gateway:$client_gateway,support_gateway:$support_gateway,client_restarts:$client_restarts,support_restarts:$support_restarts},platform:{name:$platform,status:$platform_state},resources:{disk_total_blocks:$disk_total,disk_used_blocks:$disk_used,memory_total_kib:$memory_total_kib,memory_available_kib:$memory_available_kib,load:[$load1,$load5,$load15]},verify:$verify,error_counts:$errors,integration_names:$integrations,cron:{heartbeat_age_seconds:$cron_age},last_model_call:{epoch:$model_epoch,age_seconds:$model_age},update:{status:$update_status,sequence:$update_sequence,at:$update_at},handover_done:$handover_done,going_down:$going_down,planned_downtime_until:$planned_downtime_until,power_ups:$power_ups,tools:$tools,access:$access,push:{failures_since_last_ok:$push_failures}}' > "$tmp"
+
+jq -e --slurpfile schema "$kit_dir/contract/health-schema-v3.json" '
+  def valid($s):
+    . as $v |
+    (if $s.anyOf then any($s.anyOf[]; . as $branch | $v | valid($branch)) else true end) and
+    (if $s.const != null then . == $s.const else true end) and
+    (if $s.enum then ($s.enum | index($v)) != null else true end) and
+    (if $s.type == "object" then type == "object" elif $s.type == "array" then type == "array" elif $s.type == "integer" then type == "number" and floor == . elif $s.type then type == $s.type else true end) and
+    (if $s.pattern then type == "string" and test($s.pattern) else true end) and
+    (if $s.minimum != null then . >= $s.minimum else true end) and
+    (if $s.type == "object" then
+      (($s.required // []) | all(.[]; . as $key | $v | has($key))) and
+      ($v | to_entries | all(.[]; . as $entry |
+        (($s.additionalProperties != false) or ($s.properties | has($entry.key))) and
+        (if $s.properties[$entry.key] then $entry.value | valid($s.properties[$entry.key]) else true end)))
+     else true end) and
+    (if $s.type == "array" then
+      (if $s.minItems then length >= $s.minItems else true end) and
+      (if $s.maxItems then length <= $s.maxItems else true end) and
+      (if $s.uniqueItems then length == (unique | length) else true end) and
+      (if $s.items then all(.[]; valid($s.items)) else true end)
+     else true end);
+  valid($schema[0])
+' "$tmp" >/dev/null
+if [[ $mode == --redaction-test ]]; then
+  while IFS= read -r sentinel; do [[ -z $sentinel ]] || ! grep -Fq "$sentinel" "$tmp" || { rm -f "$tmp"; echo 'health redaction guard failed' >&2; exit 1; }; done <<<"$sentinels"
+fi
+if [[ ${KIT_HEALTH_TEST_MODE:-} == 1 ]]; then cp "$tmp" "$health_file"; else install -o root -g hermes-support -m 0640 "$tmp" "$health_file"; fi
+support_skill=/var/lib/hermes-support/skills/health-report/SKILL.md
+support_template=/var/lib/hermes-support/skills/health-report/SKILL.template.md
+if [[ -r $support_template && ${KIT_HEALTH_TEST_MODE:-} != 1 ]]; then
+  skill_tmp=$(mktemp "$health_state_dir/.support-skill.XXXXXX")
+  { cat "$support_template"; printf '\n```json\n'; jq -c . "$health_file"; printf '\n```\n'; } > "$skill_tmp"
+  if [[ $mode == --redaction-test ]]; then
+    while IFS= read -r sentinel; do [[ -z $sentinel ]] || ! grep -Fq "$sentinel" "$skill_tmp" || { rm -f "$tmp" "$skill_tmp"; echo 'health skill redaction guard failed' >&2; exit 1; }; done <<<"$sentinels"
+  fi
+  install -o root -g hermes-support -m 0640 "$skill_tmp" "$support_skill"
+  rm -f "$skill_tmp"
+fi
+rm -f "$tmp"
+if [[ $mode == --explain ]]; then jq '{generated_at,status,agent_id,tier,services,platform,resources,verify,error_counts,integration_names,cron,last_model_call,update,handover_done,going_down,planned_downtime_until,power_ups,tools,access,push}' "$health_file"; else cat "$health_file"; fi
+[[ $mode != --redaction-test ]] || echo 'PASS health report redaction canaries absent'

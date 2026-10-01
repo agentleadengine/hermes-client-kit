@@ -1,0 +1,42 @@
+# Explicit per-platform lists prevent future updates from silently widening the
+# managed tool surface.
+web:
+  search_backend: searxng
+# Never reply with pairing codes or declines to an unknown contact.
+unauthorized_dm_behavior: ignore
+approvals:
+  mode: manual
+  denial_breaker_threshold: 3
+  deny:
+    - "git push --force*"
+    - "*curl*|*sh*"
+    - "dd if=* of=/dev/*"
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  write_approval: true
+skills:
+  write_approval: true
+  guard_agent_created: true
+agent:
+  disabled_toolsets:
+    - terminal
+    - code_execution
+    - browser
+    - computer_use
+    - delegation
+    - kanban
+    - cronjob
+    - image_gen
+    - tts
+    - homeassistant
+    - messaging
+platform_toolsets:
+  cli: [clarify, file, memory, search, skills, todo, vision, web]
+  telegram: [clarify, file, memory, search, skills, todo, vision, web]
+  photon: [clarify, file, memory, search, skills, todo, vision, web]
+  whatsapp: [clarify, file, memory, search, skills, todo, vision, web]
+  signal: [clarify, file, memory, search, skills, todo, vision, web]
+  slack: [clarify, file, memory, search, skills, todo, vision, web]
+  agentmail: [clarify, file, memory, search, skills, todo, vision, web]
+  cron: [clarify, file, memory, search, skills, todo, vision, web]

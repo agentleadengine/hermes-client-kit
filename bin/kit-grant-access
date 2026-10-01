@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+kit_dir=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=../lib/sshd-transaction.sh
+source "$kit_dir/lib/sshd-transaction.sh"
+
+usage() { echo 'Usage: kit-grant-access --public-key FILE --hours 1..24 --waiver ID [--setup] [--bootstrap]' >&2; exit 2; }
+[[ ${EUID} -eq 0 ]] || { echo 'kit-grant-access must run as root with the client present.' >&2; exit 1; }
+public_key='' hours='' waiver='' setup=false bootstrap=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --public-key) public_key=${2:-}; shift 2 ;;
+    --hours) hours=${2:-}; shift 2 ;;
+    --waiver) waiver=${2:-}; shift 2 ;;
+    --setup) setup=true; shift ;;
+    --bootstrap) bootstrap=true; shift ;;
+    *) usage ;;
+  esac
+done
+[[ -r $public_key && $hours =~ ^[0-9]+$ && $waiver =~ ^[A-Za-z0-9._-]+$ ]] || usage
+(( hours >= 1 && hours <= 24 )) || { echo 'Access duration must be between 1 and 24 hours.' >&2; exit 1; }
+[[ $setup != true || $hours -le 8 ]] || { echo 'Setup access is limited to 8 hours.' >&2; exit 1; }
+[[ $bootstrap != true || $setup == true ]] || { echo '--bootstrap is only valid for bounded setup access.' >&2; exit 1; }
+timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes || { echo 'Clock is not synchronized; refusing to issue access.' >&2; exit 1; }
+[[ $(ssh-keygen -lf "$public_key" | wc -l | tr -d ' ') == 1 ]] || { echo 'Public-key file must contain exactly one key.' >&2; exit 1; }
+key_fingerprint=$(ssh-keygen -lf "$public_key" | awk '{print $2}')
+echo "Client confirmation required: sign $key_fingerprint for $hours hour(s), waiver $waiver."
+if [[ $bootstrap == true ]]; then
+  confirmation=BOOTSTRAP
+else
+  read -r -p 'Type GRANT to continue: ' confirmation
+  [[ $confirmation == GRANT ]] || { echo 'Grant cancelled.' >&2; exit 1; }
+fi
+install -d -m 0700 /run/hermes-kit/grants /var/lib/hermes-kit/grants /etc/ssh/kit
+install -d -m 0755 /etc/ssh/auth_principals
+if [[ ! -f /etc/ssh/kit/client-ca ]]; then ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/kit/client-ca; fi
+[[ -f /etc/ssh/kit/revoked.krl ]] || ssh-keygen -q -k -f /etc/ssh/kit/revoked.krl
+chmod 0600 /etc/ssh/kit/client-ca
+chmod 0644 /etc/ssh/kit/client-ca.pub /etc/ssh/kit/revoked.krl
+if ! id -u hermes-ops >/dev/null 2>&1; then useradd --create-home --shell /usr/bin/tlog-rec-session hermes-ops; fi
+install -m 0644 /dev/stdin /etc/ssh/auth_principals/hermes-ops <<'EOF'
+ops
+EOF
+install -m 0440 /dev/stdin /etc/sudoers.d/90-hermes-kit-hermes-ops <<'EOF'
+hermes-ops ALL=(ALL:ALL) NOPASSWD: ALL
+EOF
+visudo -cf /etc/sudoers.d/90-hermes-kit-hermes-ops
+install -d -m 0755 /etc/ssh/sshd_config.d
+ssh_policy=$(mktemp)
+cat > "$ssh_policy" <<'EOF'
+TrustedUserCAKeys /etc/ssh/kit/client-ca.pub
+AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u
+RevokedKeys /etc/ssh/kit/revoked.krl
+Match User hermes-ops
+    AuthenticationMethods publickey
+    AuthorizedKeysFile none
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    PermitTTY yes
+EOF
+if ! sshd_file_apply /etc/ssh/sshd_config.d/10-hermes-kit-access.conf "$ssh_policy"; then
+  rm -f "$ssh_policy"
+  exit 1
+fi
+rm -f "$ssh_policy"
+systemctl reload ssh || systemctl restart ssh.socket
+ledger=/var/lib/hermes-kit/grants/ledger.tsv
+touch "$ledger"; chmod 0600 "$ledger"
+serial=$(( $(awk -F '\t' 'BEGIN { max=0 } $1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { print max }' "$ledger") + 1 ))
+grant_id="grant-$(date -u +%Y%m%dT%H%M%SZ)-$serial"
+certificate="/run/hermes-kit/grants/$grant_id-cert.pub"
+cp "$public_key" "/run/hermes-kit/grants/$grant_id.pub"
+ssh-keygen -s /etc/ssh/kit/client-ca -I "$grant_id" -n ops -V "now:+${hours}h" -z "$serial" "/run/hermes-kit/grants/$grant_id.pub" >/dev/null
+expires=$(date -u -d "+${hours} hours" +%FT%TZ)
+printf '%s\t%s\t%s\t%s\t%s\n' "$serial" "$grant_id" "$expires" "$waiver" "$key_fingerprint" >> "$ledger"
+install -m 0644 "$certificate" "/var/lib/hermes-kit/grants/$grant_id-cert.pub"
+rm -f "/run/hermes-kit/grants/$grant_id.pub" "$certificate"
+systemctl enable --now hermes-kit-grant-cleanup.timer
+printf '%s grant-issued id=%s expires=%s waiver=%s fingerprint=%s\n' "$(date -u +%FT%TZ)" "$grant_id" "$expires" "$waiver" "$key_fingerprint" >> /var/lib/hermes-kit/access-events.log
+echo "Certificate: /var/lib/hermes-kit/grants/$grant_id-cert.pub"
+echo "CA public key: /etc/ssh/kit/client-ca.pub"
+echo "Grant ID: $grant_id (expires $expires)"
