@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Record the client's setup choices and enable the starter capabilities."""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from kit_powerup import on
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--consent-id", required=True, help="Reference to the client's setup approval record")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error("Run as root during the client setup window")
+    if not args.consent_id or not all(character.isalnum() or character in "._-" for character in args.consent_id) or len(args.consent_id) > 80:
+        parser.error("Use a simple consent record ID")
+    for capability in ("tailscale", "builder", "website", "netlify", "media"):
+        on(capability, None, args.client, confirmation="setup:" + args.consent_id)
+    print("Starter capabilities recorded for the client. Netlify and Tailscale still need client-owned setup keys.")
+
+
+if __name__ == "__main__":
+    main()

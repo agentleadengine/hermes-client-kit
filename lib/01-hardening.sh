@@ -72,15 +72,16 @@ ufw --force enable
 systemctl enable --now fail2ban
 systemctl enable --now rsyslog
 install -d -m 0755 /var/lib/hermes-kit
+ln -sfn "$KIT_RUNTIME_DIR/bin/kit-access-log" /usr/local/bin/kit-access-log
 install -m 0644 /dev/stdin /etc/systemd/system/hermes-kit-access-log.service <<'EOF'
 [Unit]
 Description=Refresh client-readable Hermes operator access log
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'umask 022; { journalctl --no-pager -u ssh -u sshd -t sudo 2>/dev/null || true; test -f /var/log/auth.log && grep -E "sshd.*Accepted|sudo:" /var/log/auth.log || true; test -f /var/lib/hermes-kit/access-events.log && cat /var/lib/hermes-kit/access-events.log || true; } | sort -u > /var/lib/hermes-kit/access-log.txt'
-ExecStartPost=/bin/chown root:root /var/lib/hermes-kit/access-log.txt
-ExecStartPost=/bin/chmod 0644 /var/lib/hermes-kit/access-log.txt
+ExecStart=/bin/sh -c '/usr/local/bin/kit-access-log >/dev/null'
+ExecStartPost=/bin/chown root:hermes /var/lib/hermes-kit/access-log.txt
+ExecStartPost=/bin/chmod 0640 /var/lib/hermes-kit/access-log.txt
 EOF
 install -m 0644 /dev/stdin /etc/systemd/system/hermes-kit-access-log.timer <<'EOF'
 [Unit]

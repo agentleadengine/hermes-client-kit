@@ -25,6 +25,7 @@ check_id() {
     *health*|*HEALTH*) printf '%s' CHECK_HEALTH ;;
     *enroll*|*ENROLL*) printf '%s' CHECK_ENROLLMENT ;;
     *support*|*SUPPORT*) printf '%s' CHECK_SUPPORT ;;
+    *SETUP*) case ${tier:-care} in care) printf '%s' CHECK_CARE_ACCESS ;; managed) printf '%s' CHECK_MANAGED_ACCESS ;; full) printf '%s' CHECK_LUDICROUS_ACCESS ;; esac ;;
     *CARE*) printf '%s' CHECK_CARE_ACCESS ;;
     *LUDICROUS*) printf '%s' CHECK_LUDICROUS_ACCESS ;;
     *MANAGED*) printf '%s' CHECK_MANAGED_ACCESS ;;
@@ -32,6 +33,7 @@ check_id() {
     *TOOL*) printf '%s' CHECK_TOOLS ;;
     *LOGINS*) printf '%s' CHECK_LOGINS ;;
     *SCHEDULES*) printf '%s' CHECK_SCHEDULES ;;
+    *MCP*) printf '%s' CHECK_MCP_POLICY ;;
     *) printf '%s' CHECK_POLICY_BASELINE ;;
   esac
 }
@@ -78,6 +80,15 @@ effective_json_is() {
   actual=$(effective_value "$1" 2>/dev/null | canonical_json || true)
   expected=$(printf '%s' "$2" | canonical_json || true)
   [[ -n $actual && $actual == "$expected" ]]
+}
+expected_mcp_tools() {
+  local platform=$1 native=$2
+  if [[ -f /etc/hermes-kit/consents.json ]]; then
+    jq -cn --arg platform "$platform" --argjson native "$native" --slurpfile ledger /etc/hermes-kit/consents.json \
+      '$native + (([$ledger[0].consents[]? | select(.mcp_server != null and (.mcp_platforms | index($platform) != null)) | .mcp_server] | unique) as $servers | if ($servers | length) == 0 then ["no_mcp"] else $servers end)'
+  else
+    jq -cn --argjson native "$native" '$native + ["no_mcp"]'
+  fi
 }
 
 # The Hermes installer has used both venv/ and .venv/ for its environment.
@@ -194,20 +205,33 @@ if grep -x 'passwordauthentication no' <<<"$sshd_effective" >/dev/null; then pas
 if ufw status verbose | grep >/dev/null 'Default: deny (incoming)'; then pass 'UFW default deny inbound'; else fail 'UFW default deny inbound'; fi
 if ufw status | grep >/dev/null 'Status: active'; then pass 'UFW active'; else fail 'UFW active'; fi
 
-non_loop_ports=$(ss -lntH | awk '
+non_loop_listeners=$(ss -lntH | awk '
   function loopback(address) {
     return address ~ /^127\.[0-9]+\.[0-9]+\.[0-9]+:/ || address ~ /^\[::1\]:/
   }
   !loopback($4) {
     address = $4
     sub(/^.*:/, "", address)
-    print address
+    print $4 "\t" address
   }
 ' | sort -u || true)
 # The client's activation / Assistant Home page (Caddy on 80/443) is open on purpose for a limited time.
 allowed_ports='22'
 if systemctl is-active --quiet hermes-kit-activation.service && systemctl is-active --quiet caddy; then allowed_ports='22 80 443'; fi
-unexpected_ports=$(for port in $non_loop_ports; do [[ " $allowed_ports " == *" $port "* ]] || printf '%s ' "$port"; done)
+tailnet_ip4=$(tailscale ip -4 2>/dev/null || true)
+tailnet_ip6=$(tailscale ip -6 2>/dev/null || true)
+unexpected_ports=''
+while IFS=$'\t' read -r address port; do
+  [[ -n $port ]] || continue
+  if [[ " $allowed_ports " == *" $port "* ]]; then continue; fi
+  host=${address%:*}
+  if [[ $port == 8899 ]] && consent_exists tailscale && consent_exists website &&
+     [[ $host == "$tailnet_ip4" || $host == "[$tailnet_ip6]" ]]; then continue; fi
+  if consent_exists tailscale && consent_exists builder && [[ $port =~ ^88[0-9][0-9]$ || $port =~ ^89[0-9][0-9]$ ]] &&
+     [[ $host == "$tailnet_ip4" || $host == "[$tailnet_ip6]" ]] &&
+     jq -e --argjson port "$port" '.tools[]? | select(.port == $port and .up == true)' /srv/tools/registry.json >/dev/null 2>&1; then continue; fi
+  unexpected_ports+="$port "
+done <<<"$non_loop_listeners"
 if [[ -z $unexpected_ports ]]; then pass "only expected ports listen off loopback ($allowed_ports)"; else fail "unexpected non-loopback listener(s): ${unexpected_ports% }"; fi
 
 hermes_groups=$(id -nG hermes)
@@ -228,7 +252,8 @@ if consent_exists logins; then
   approved_disabled=$(jq -c 'map(select(. != "browser"))' <<<"$approved_disabled")
   approved_platform_tools=$(jq -c '. + ["browser"]' <<<"$approved_platform_tools")
 fi
-cron_tools='["clarify","file","memory","search","skills","todo","vision","web"]'
+approved_platform_tools=$(expected_mcp_tools cli "$approved_platform_tools")
+cron_tools=$(expected_mcp_tools cron '["clarify","file","memory","search","skills","todo","vision","web"]')
 if effective_json_is agent.disabled_toolsets "$approved_disabled" && effective_json_is platform_toolsets.cli "$approved_platform_tools" && effective_json_is platform_toolsets.cron "$cron_tools"; then pass 'effective global and cron tool policy exactly matches approved capabilities'; else fail 'effective global and cron tool policy exactly matches approved capabilities'; fi
 if consent_exists logins; then
   logins_domains=$(python3 - "$kit_dir/lib" <<'PY'
@@ -316,7 +341,13 @@ PY
     if [[ $port =~ ^[0-9]+$ ]]; then
       health_code=$(curl --silent --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || true)
       if [[ $up == true ]]; then
-        [[ $health_code == 403 ]] || tools_ok=false
+        if consent_exists tailscale; then
+          blocked_code=$(runuser -u hermes -- curl --silent --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || true)
+          served_code=$(curl --silent --max-time 3 -H 'Tailscale-User-Login: kit-verify@example.invalid' -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || true)
+          [[ $blocked_code == 000 && $served_code == 200 && $nft_rules == *"meta skuid != 0 drop"* ]] || tools_ok=false
+        else
+          [[ $health_code == 403 ]] || tools_ok=false
+        fi
       else
         [[ $health_code == 000 ]] || tools_ok=false
       fi
@@ -370,10 +401,29 @@ case $MESSAGING_PLATFORM in
     messaging_secret=
     ;;
 esac
-if [[ $MESSAGING_PLATFORM != none ]] && ! effective_json_is "platform_toolsets.$MESSAGING_PLATFORM" "$approved_platform_tools"; then fail "$MESSAGING_PLATFORM effective tool policy matches baseline"; fi
+if [[ $MESSAGING_PLATFORM != none ]]; then
+  messaging_tools=$(expected_mcp_tools "$MESSAGING_PLATFORM" '["clarify","file","memory","search","skills","todo","vision","web"]')
+  if consent_exists logins; then messaging_tools=$(expected_mcp_tools "$MESSAGING_PLATFORM" '["clarify","file","memory","search","skills","todo","vision","web","browser"]'); fi
+  if ! effective_json_is "platform_toolsets.$MESSAGING_PLATFORM" "$messaging_tools"; then fail "$MESSAGING_PLATFORM effective tool policy matches baseline"; fi
+fi
 if [[ -n ${messaging_allowlist:-} ]]; then
-  if validate_explicit_allowlist "$(dotenv_value "$messaging_allowlist")"; then pass "$MESSAGING_PLATFORM allowlist set"; else fail "$MESSAGING_PLATFORM allowlist set"; fi
-  if env_has_value "$messaging_secret"; then
+  if [[ $MESSAGING_PLATFORM == photon ]] && { ! env_has_value PHOTON_PROJECT_ID || ! env_has_value PHOTON_PROJECT_SECRET; }; then
+    warn 'photon credentials not configured'
+  elif validate_explicit_allowlist "$(dotenv_value "$messaging_allowlist")"; then
+    pass "$MESSAGING_PLATFORM allowlist set"
+  else
+    fail "$MESSAGING_PLATFORM allowlist set"
+  fi
+  if [[ $MESSAGING_PLATFORM == photon ]]; then
+    if env_has_value PHOTON_PROJECT_ID && env_has_value PHOTON_PROJECT_SECRET; then
+      if systemctl is-active --quiet hermes-gateway.service &&
+         python3 "$kit_dir/lib/photon_verify.py" "$hermes_root" "$hermes_home"; then
+        pass 'Photon gateway adapter and child sidecar connected'
+      else
+        fail 'Photon gateway adapter or child sidecar disconnected'
+      fi
+    fi
+  elif env_has_value "$messaging_secret"; then
     if systemctl is-active --quiet hermes-gateway.service; then pass 'client gateway service active'; else fail 'client gateway service active'; fi
   else
     warn "$MESSAGING_PLATFORM credentials not configured"
@@ -393,7 +443,10 @@ elif [[ $MESSAGING_PLATFORM == agentmail ]]; then
 fi
 
 if [[ -f "$hermes_home/distribution.yaml" ]]; then pass 'client profile distribution installed'; else fail 'client profile distribution installed'; fi
-if [[ -f "$hermes_home/SKILLS.sha256" ]] && cmp -s "$kit_dir/profile/SKILLS.sha256" "$hermes_home/SKILLS.sha256" && (cd "$hermes_home" && sha256sum -c SKILLS.sha256 >/dev/null); then pass 'shipped skill tree and baseline manifest match'; else fail 'shipped skill tree and baseline manifest match'; fi
+if cmp -s "$kit_dir/profile/GUIDE.md" "$hermes_home/GUIDE.md" && cmp -s "$kit_dir/profile/NOTICE" "$hermes_home/NOTICE"; then pass 'client guide and MIT notice installed'; else fail 'client guide or MIT notice differs'; fi
+if python3 "$kit_dir/lib/kit_profile.py" verify "$kit_dir/profile" "$hermes_home" "${ASSISTANT_NAME:-}" >/dev/null 2>&1; then pass 'shipped profile templates and skill tree match'; else fail 'shipped profile templates or skill tree differ'; fi
+if cmp -s "$kit_dir/profile/GUIDE.md" "$hermes_home/GUIDE.md" && cmp -s "$kit_dir/profile/NOTICE" "$hermes_home/NOTICE" && grep -Fq 'MIT' "$hermes_home/NOTICE"; then pass 'client guide and MIT attribution intact'; else fail 'client guide or MIT attribution differs'; fi
+if [[ ${ASSISTANT_NAME:-} == Donna ]] || ! grep -Fq 'Donna' "$hermes_home/SOUL.md"; then pass 'assistant name has no stale Donna persona'; else fail 'assistant name contains stale Donna persona'; fi
 if [[ -e "$hermes_home/skills/productivity/google-workspace" ]]; then fail 'google-workspace skill absent by default'; else pass 'google-workspace skill absent by default'; fi
 actual_skills=$(cd "$hermes_home" && find skills -type f -name SKILL.md -printf '%P\n' | sort)
 manifest_skills=$(awk '{print $2}' "$hermes_home/SKILLS.sha256" 2>/dev/null | sed 's#^\./##; s#^skills/##' | sort)
@@ -405,17 +458,36 @@ while IFS= read -r skill; do
   consent_exists "${skill%/SKILL.md}" || unconsented_skill=true
 done <<<"$actual_skills"
 if [[ $unconsented_skill == false ]]; then pass 'profile skills are baseline or consented'; else fail 'unconsented profile skill present'; fi
-if [[ -f "$hermes_home/mcp.json" ]] && jq -e . "$hermes_home/mcp.json" >/dev/null 2>&1; then
-  unconsented_mcp=false
-  while IFS= read -r server; do [[ -z $server ]] || consent_exists "mcp:$server" || unconsented_mcp=true; done < <(jq -r 'if type == "object" then keys[] else empty end' "$hermes_home/mcp.json")
-  [[ $unconsented_mcp == false ]] && pass 'every MCP server is baseline or consented' || fail 'unconsented MCP server'
-else fail 'MCP configuration is valid JSON'; fi
+if python3 "$kit_dir/lib/kit_mcp_audit.py" >/dev/null 2>&1; then pass 'MCP effective access matches platform consent'; else fail 'MCP effective access matches platform consent'; fi
 unconsented_plugin=false
 while IFS= read -r plugin; do
   [[ -z $plugin || ${ENABLE_HINDSIGHT:-false} == true && $plugin == hindsight ]] && continue
   consent_exists "plugin:$plugin" || unconsented_plugin=true
 done < <(find "$hermes_root/plugins" "$hermes_home/plugins" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -u)
 [[ $unconsented_plugin == false ]] && pass 'plugins are baseline or consented' || fail 'unconsented plugin present'
+starter_plugin="$hermes_home/plugins/kit-starter"
+if consent_exists builder || consent_exists website || consent_exists media; then
+  if consent_exists plugin:kit-starter && cmp -s "$kit_dir/plugins/kit-starter/__init__.py" "$starter_plugin/__init__.py" && cmp -s "$kit_dir/plugins/kit-starter/plugin.yaml" "$starter_plugin/plugin.yaml" && cmp -s "$kit_dir/lib/kit_website.py" "$starter_plugin/kit_website.py" && cmp -s "$kit_dir/lib/kit_video.py" "$starter_plugin/kit_video.py" && [[ $(stat -c '%U:%a' "$starter_plugin/__init__.py" 2>/dev/null) == root:644 ]] && effective_value plugins.enabled 2>/dev/null | jq -e 'type == "array" and index("kit-starter") != null' >/dev/null; then pass 'starter plugin is consented, enabled, and matches pinned kit'; else fail 'starter plugin missing, disabled, or altered'; fi
+fi
+if consent_exists website; then
+  if all_tcp_listeners_loopback 8899 && systemctl is-active --quiet hermes-kit-website-preview.service; then pass 'website preview stays on loopback'; else fail 'website preview is unavailable or exposed'; fi
+fi
+if consent_exists netlify; then
+  if consent_exists website && [[ $(/usr/local/bin/netlify --version 2>/dev/null) == *27.10.2* ]] && env_has_value NETLIFY_AUTH_TOKEN && jq -e '.netlify_site_id | type == "string" and length >= 3' /home/hermes/.local/state/hermes-kit/website.json >/dev/null 2>&1; then pass 'Netlify client site and pinned CLI ready'; else fail 'Netlify client site, token, or CLI missing'; fi
+fi
+if consent_exists tailscale; then
+  tailscale_fingerprint=$(gpg --show-keys --with-colons /usr/share/keyrings/tailscale-archive-keyring.gpg 2>/dev/null | awk -F: '$1 == "fpr" {print $10; exit}' || true)
+  if [[ $tailscale_fingerprint == 2596A99EAAB33821893C0A79458CA832957F5868 ]] && [[ -x /usr/bin/tailscale ]] && tailscale status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null; then pass 'client Tailscale joined with pinned repository key'; else fail 'Tailscale key, package, or client join missing'; fi
+  if tailscale serve status --json 2>/dev/null | jq -e 'def private: ((.AllowFunnel // {}) | all(.[]; . != true)) and ((.Foreground // {}) | all(.[]; private)); private' >/dev/null; then pass 'Tailscale has no public Funnel'; else fail 'Tailscale Funnel is active or serve status unavailable'; fi
+elif tailscale status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null; then
+  fail 'Tailscale joined without client consent'
+fi
+if consent_exists media; then
+  if [[ $(dpkg-query -W -f='${Version}' ffmpeg 2>/dev/null) == '7:6.1.1-3ubuntu5' ]] && command -v ffprobe >/dev/null && { command -v chromium >/dev/null || command -v chromium-browser >/dev/null; }; then pass 'pinned local HTML-to-video toolchain ready'; else fail 'media ffmpeg pin or Chromium missing'; fi
+fi
+if consent_exists builder; then
+  if systemctl is-active --quiet hermes-kit-starter.service && [[ $(stat -c '%U:%G:%a' /run/hermes-kit/starter.sock 2>/dev/null) == root:hermes:660 ]]; then pass 'Builder starter bridge is local and owner restricted'; else fail 'Builder starter bridge unavailable'; fi
+fi
 unconsented_credential=false
 while IFS=$'\t' read -r key _; do
   [[ $key =~ (API_KEY|TOKEN|SECRET|PASSWORD|OAUTH|IMAP|SMTP|EMAIL) ]] || continue
@@ -491,7 +563,7 @@ else
   warn 'enrollment pending; signed reports start after HQ accepts this box'
 fi
 support_disabled='["file","memory","terminal","code_execution","browser","computer_use","delegation","kanban","cronjob","image_gen","tts","homeassistant","messaging","web","search","vision"]'
-support_tools='["clarify","skills"]'
+support_tools='["clarify","skills","no_mcp"]'
 support_policy=false
 support_hermes=/opt/hermes-support-runtime/current/bin/hermes
 support_effective_json_is() {
@@ -522,6 +594,10 @@ else
   fail 'ACTIVATION_PAGE_OFF'
 fi
 if [[ -f /home/hermes/.local/state/syncthing/config.xml ]] && grep -q '<relaysEnabled>false</relaysEnabled>' /home/hermes/.local/state/syncthing/config.xml && grep -q '<globalAnnounceEnabled>false</globalAnnounceEnabled>' /home/hermes/.local/state/syncthing/config.xml; then pass 'Syncthing relays and global discovery disabled'; else fail 'Syncthing relays and global discovery disabled'; fi
+# shellcheck source=../lib/setup-window-verify.sh
+setup_open=false
+source "$kit_dir/lib/setup-window-verify.sh"
+verify_setup_window
 if [[ $tier == care || $tier == managed ]]; then
   if [[ ! -s /etc/hermes-kit/full/authorized_keys && ! -s /etc/ssh/kit-full.keys ]]; then pass 'CARE has no standing full key'; else fail 'CARE_FULL_ACCESS_KEY'; fi
   if ! id -u ops >/dev/null 2>&1 && ! id -u hermes-ops >/dev/null 2>&1 && { [[ $tier == managed ]] || ! id -u kit-manager >/dev/null 2>&1; }; then pass 'CARE has no operator Unix account'; else fail 'CARE_OPERATOR_ACCOUNT'; fi
@@ -598,7 +674,13 @@ else
     ssh-keygen -Q -f /etc/ssh/kit/revoked.krl "$certificate" >/dev/null 2>&1 || ludicrous_valid=false
   done
   (( active_certificates > 0 )) || [[ -s /etc/hermes-kit/full/authorized_keys ]] || ludicrous_valid=false
-  [[ $ludicrous_valid == true ]] && pass 'LUDICROUS_BOUNDED_ACCESS' || fail 'LUDICROUS_BOUNDED_ACCESS'
+  if [[ $ludicrous_valid == true ]]; then
+    pass 'LUDICROUS_BOUNDED_ACCESS'
+  elif [[ $setup_open == true && ! -s /etc/hermes-kit/full/authorized_keys && ! -s /etc/ssh/kit-full.keys && ! -e /etc/sudoers.d/90-hermes-kit-hermes-ops ]] && ! compgen -G '/var/lib/hermes-kit/grants/*-cert.pub' >/dev/null; then
+    warn 'LUDICROUS standing access awaits waiver during SETUP window'
+  else
+    fail 'LUDICROUS_BOUNDED_ACCESS'
+  fi
 fi
 no_known_secret_patterns() {
   python3 - /etc/hermes "$hermes_home"/SOUL.md "$hermes_home"/config.yaml "$hermes_home"/mcp.json "$hermes_home"/distribution.yaml "$hermes_home"/skills <<'PY'

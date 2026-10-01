@@ -88,6 +88,11 @@ def consent():
     return path.exists() and any(x.get("integration") == "builder" for x in json.loads(path.read_text()).get("consents", []))
 
 
+def tailnet_mode():
+    path = ETC / "consents.json"
+    return path.exists() and any(x.get("integration") == "tailscale" for x in json.loads(path.read_text()).get("consents", []))
+
+
 def need_builder():
     if not consent() and not TEST:
         raise ValueError("Builder power-up is off")
@@ -142,7 +147,7 @@ def setup():
     root()
     if not TEST:
         run(["apt-get", "-y", "--no-install-recommends", "install", "podman", "uidmap", "nftables", "age"])
-        if not shutil.which("cloudflared"):
+        if not tailnet_mode() and not shutil.which("cloudflared"):
             keyring = Path("/usr/share/keyrings/cloudflare-main.gpg")
             run(["curl", "--fail", "--silent", "--show-error", "--location", "https://pkg.cloudflare.com/cloudflare-main.gpg", "--output", keyring])
             keyring.chmod(0o644)
@@ -153,7 +158,7 @@ def setup():
             run(["useradd", "--create-home", "--shell", "/bin/bash", "builder"])
         ensure_subids("builder")
         run(["loginctl", "enable-linger", "builder"])
-        if run(["id", "-u", "cloudflared"], capture=True, check=False).returncode:
+        if not tailnet_mode() and run(["id", "-u", "cloudflared"], capture=True, check=False).returncode:
             run(["useradd", "--system", "--home", "/var/lib/cloudflared", "--shell", "/usr/sbin/nologin", "cloudflared"])
     for path in (ROOT / "src", ROOT / "staging", ROOT / "releases", BACKUP):
         path.mkdir(parents=True, exist_ok=True)
@@ -221,6 +226,10 @@ def install_firewall():
         if line.startswith("nameserver ") and re.fullmatch(r"[0-9.]+", line.split()[1]):
             dns_addresses.add(line.split()[1])
     lines = ["table inet hermes_kit_tools {", "set builder_ipv4 { type ipv4_addr; flags interval; elements = { " + ", ".join(sorted(addresses)) + " } }", "set dns_ipv4 { type ipv4_addr; flags interval; elements = { " + ", ".join(sorted(dns_addresses or {"127.0.0.1"})) + " } }", "chain output { type filter hook output priority 0; policy accept;"]
+    if tailnet_mode():
+        ports = sorted({int(item["port"]) for item in registry().get("tools", []) if isinstance(item.get("port"), int) and 8801 <= item["port"] <= 8999})
+        if ports:
+            lines.append("ip daddr 127.0.0.1 tcp dport { " + ", ".join(map(str, ports)) + " } meta skuid != 0 drop")
     for user, uid in ids.items():
         lines += [f"meta skuid {uid} ip daddr 127.0.0.0/8 accept", f"meta skuid {uid} ip6 daddr ::1 accept"]
         if user == "builder":
@@ -279,6 +288,8 @@ def stage(name, source=None, template=False, commit=None):
     if not item.get("port"):
         item["port"] = allocate_port(data)
     save_registry(data)
+    if not TEST and tailnet_mode():
+        install_firewall()
     audit("stage", name, commit=resolved)
     print(resolved)
 
@@ -506,7 +517,11 @@ def _publish_checked(name, client, reviewer, ack_unreviewed, data, item, commit,
 def install_service(name, user, port):
     image = validate_runtime()
     local_image = prepare_image(user, image)
-    shutil.copy2(ETC / "tools-access.json", ROOT / "access.json")
+    if tailnet_mode():
+        (ROOT / "access.json").write_text('{"mode":"tailscale"}\n')
+        (ROOT / "access-certs.json").write_text('{}\n')
+    else:
+        shutil.copy2(ETC / "tools-access.json", ROOT / "access.json")
     (ROOT / "access.json").chmod(0o644)
     unit = Path(f"/etc/systemd/system/hermes-kit-tool-{name}.service")
     uid = run(["id", "-u", user], capture=True).stdout.strip()
@@ -570,21 +585,22 @@ def validate_runtime():
     image = image_file.read_text().strip() if image_file.exists() else ""
     if not re.fullmatch(r"[a-zA-Z0-9./_-]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("Set a reviewed pinned Python image in /etc/hermes-kit/tools-python-image")
-    if not (ETC / "tools-access.json").is_file():
+    if not tailnet_mode() and not (ETC / "tools-access.json").is_file():
         raise ValueError("Cloudflare Access configuration is missing")
     if not (ETC / "tools-backup.json").is_file():
         raise ValueError("Client tool backup recovery key is required")
-    certs = ROOT / "access-certs.json"
-    if not certs.is_file() or datetime.now(timezone.utc).timestamp() - json.loads(certs.read_text()).get("fetched_at", 0) > 86400:
-        raise ValueError("Fresh Cloudflare Access signing keys are required")
+    if not tailnet_mode():
+        certs = ROOT / "access-certs.json"
+        if not certs.is_file() or datetime.now(timezone.utc).timestamp() - json.loads(certs.read_text()).get("fetched_at", 0) > 86400:
+            raise ValueError("Fresh Cloudflare Access signing keys are required")
     return image
 
 
 def origin_denies_without_token(port):
     import time
     for _ in range(10):
-        result = run(["curl", "--silent", "--max-time", "2", "--output", "/dev/null", "--write-out", "%{http_code}", f"http://127.0.0.1:{port}/health"], capture=True, check=False)
-        if result.stdout == "403":
+        result = run(["curl", "--silent", "--max-time", "2", "--output", "/dev/null", "--write-out", "%{http_code}", f"http://127.0.0.1:{port}/health"], user="hermes" if tailnet_mode() and not TEST else None, capture=True, check=False)
+        if result.stdout == ("000" if tailnet_mode() and not TEST else "403"):
             return True
         time.sleep(1)
     return False
@@ -766,6 +782,8 @@ def backup_key():
 
 def connect(token):
     root(); need_builder()
+    if tailnet_mode():
+        raise ValueError("Public Cloudflare tunnel is disabled for client tailnet tools")
     if token == "-":
         token = sys.stdin.read(4097).strip()
     if not token or "\n" in token or len(token) > 4096:
@@ -831,6 +849,8 @@ def refresh_certs():
 
 def configure_access(url, audience):
     root(); need_builder()
+    if tailnet_mode():
+        raise ValueError("Cloudflare Access is disabled for client tailnet tools")
     from access_jwt import CERTS_URL
     if not CERTS_URL.fullmatch(url) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", audience):
         raise ValueError("Enter the team's Cloudflare Access certs URL and application audience")

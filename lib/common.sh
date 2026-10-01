@@ -24,7 +24,7 @@ load_kit_config() {
     if [[ $value == \"*\" && ${#value} -ge 2 ]]; then value=${value:1:${#value}-2}; elif [[ $value == \'*\' && ${#value} -ge 2 ]]; then value=${value:1:${#value}-2}; fi
     [[ $value != *$'\n'* && $value != *$'\r'* ]] || return 1
     case $key in
-      CLIENT_NAME|OPS_SSH_PUBKEY|MODEL_PROVIDER|MODEL_NAME|MESSAGING_PLATFORM|PHOTON_ALLOWED_USERS|TELEGRAM_ALLOWED_USERS|WHATSAPP_ALLOWED_USERS|SIGNAL_ALLOWED_USERS|SLACK_ALLOWED_USERS|MAIL_ALLOWED_SENDERS|MAIL_ALLOWED_RECIPIENTS|MAILROOM_NOTIFY_PLATFORM|HERMES_COMMIT|SEARXNG_IMAGE|ENABLE_HINDSIGHT|HINDSIGHT_LLM_PROVIDER|HINDSIGHT_LLM_MODEL|HINDSIGHT_LLM_BASE_URL|KIT_TIER|KIT_AGENT_ID|KIT_ENROLL_CODE|KIT_HQ_URL|KIT_CHANNEL|SUPPORT_PLATFORM|SUPPORT_ALLOWED_USER|OTLP_HEALTH_ENDPOINT|KIT_GIT_REF|KIT_UPDATE_REPO|KIT_RELEASE_ALLOWED_SIGNER|KIT_RELEASE_MANIFEST_URL|KIT_RELEASE_SIGNER_ID|AGENT_CARE_REPORT_URL|AGENT_CARE_JOB_ID|AGENT_CARE_JOB_TOKEN|AGENT_CARE_REQUESTED_PLATFORM)
+      CLIENT_NAME|ASSISTANT_NAME|OPS_SSH_PUBKEY|MODEL_PROVIDER|MODEL_NAME|MESSAGING_PLATFORM|PHOTON_ALLOWED_USERS|TELEGRAM_ALLOWED_USERS|WHATSAPP_ALLOWED_USERS|SIGNAL_ALLOWED_USERS|SLACK_ALLOWED_USERS|MAIL_ALLOWED_SENDERS|MAIL_ALLOWED_RECIPIENTS|MAILROOM_NOTIFY_PLATFORM|HERMES_COMMIT|SEARXNG_IMAGE|ENABLE_HINDSIGHT|HINDSIGHT_LLM_PROVIDER|HINDSIGHT_LLM_MODEL|HINDSIGHT_LLM_BASE_URL|KIT_TIER|KIT_AGENT_ID|KIT_ENROLL_CODE|KIT_HQ_URL|KIT_CHANNEL|SUPPORT_PLATFORM|SUPPORT_ALLOWED_USER|OTLP_HEALTH_ENDPOINT|KIT_GIT_REF|KIT_UPDATE_REPO|KIT_RELEASE_ALLOWED_SIGNER|KIT_RELEASE_MANIFEST_URL|KIT_RELEASE_SIGNER_ID|AGENT_CARE_REPORT_URL|AGENT_CARE_JOB_ID|AGENT_CARE_JOB_TOKEN|AGENT_CARE_REQUESTED_PLATFORM)
         printf -v "$key" '%s' "$value"
         ;;
       *) ;;
@@ -102,7 +102,11 @@ run_as_hermes() {
 
 runtime_tree_hash() (
   cd "$1" || return
-  find install.sh kit.conf.example bin lib managed profile plugins support-profile templates \
+  local paths=() path
+  for path in install.sh kit.conf.example activation bin lib managed profile plugins support-profile templates; do
+    [[ ! -e $path ]] || paths+=("$path")
+  done
+  find "${paths[@]}" \
     -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0 |
     sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1
 )
@@ -146,6 +150,17 @@ set_env_value() {
   temp=$(mktemp "$file.XXXXXX")
   { grep -Ev "^${key}=" "$file" || true; printf '%s="%s"\n' "$key" "$escaped_value"; } > "$temp"
   chown "$HERMES_USER:$hermes_group" "$temp"
+  chmod 0600 "$temp"
+  mv "$temp" "$file"
+}
+
+unset_env_value() {
+  local key=$1 file=$2 temp
+  [[ $key =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
+  [[ -f $file ]] || return 0
+  temp=$(mktemp "$file.XXXXXX")
+  grep -Ev "^${key}=" "$file" > "$temp" || true
+  chown "$HERMES_USER:$(id -gn "$HERMES_USER")" "$temp"
   chmod 0600 "$temp"
   mv "$temp" "$file"
 }

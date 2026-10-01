@@ -2,6 +2,8 @@
 set -euo pipefail
 
 key=${1:-}
+mode=${2:-interactive}
+restart=${3:-restart}
 env_file=/home/hermes/.hermes/profiles/client/.env
 kit_dir="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/common.sh
@@ -15,6 +17,8 @@ if [[ ! $key =~ ^[A-Z][A-Z0-9_]*$ ]]; then
   echo 'Usage: kit-set-key UPPER_SNAKE_CASE_KEY' >&2
   exit 1
 fi
+[[ $mode == interactive || $mode == --stdin || $mode == --unset ]] || { echo 'Invalid kit-set-key mode.' >&2; exit 2; }
+[[ $restart == restart || $restart == --no-restart ]] || { echo 'Invalid kit-set-key restart option.' >&2; exit 2; }
 if [[ $key == GATEWAY_ALLOW_ALL_USERS || $key == *_ALLOW_ALL_USERS ]]; then
   echo 'Allow-all messaging keys are forbidden. Configure the selected platform allowlist instead.' >&2
   exit 1
@@ -42,16 +46,41 @@ EOF
   jq --arg date "$(date -u +%F)" --arg acknowledgement "$go_ack" '.consents = ((.consents // []) | map(select(.integration != "opencode-go")) + [{client_name:"client",date:$date,integration:"opencode-go",scopes:["model prompts, completions, request/session metadata"],risk_level:"YELLOW",warnings_shown:"OpenCode Go routing, retention, and training warning",confirmation:$acknowledgement}])' "$ledger" > "$tmp"
   chown root:root "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$ledger"
 fi
-
-read -r -s -p "Value for $key: " value
-printf '\n'
-[[ -n $value && $value != *$'\n'* && $value != *$'\r'* ]] || { echo 'A non-empty one-line value is required.' >&2; exit 1; }
-if [[ $key == *_ALLOWED_USERS ]] && ! validate_explicit_allowlist "$value"; then
-  echo 'Wildcard allowlists are forbidden. List each authorized user explicitly.' >&2
+if [[ $key == NETLIFY_AUTH_TOKEN ]] && ! jq -e '.consents[]? | select(.integration == "netlify")' /etc/hermes-kit/consents.json >/dev/null 2>&1; then
+  echo 'Enable the Netlify power-up with client consent before adding its token.' >&2
+  exit 1
+fi
+if [[ $key == TTS_API_KEY ]] && ! jq -e '.consents[]? | select(.integration == "media")' /etc/hermes-kit/consents.json >/dev/null 2>&1; then
+  echo 'Enable the Media power-up with client consent before adding a TTS key.' >&2
   exit 1
 fi
 
-forbid_allow_all_key "$key" || { echo 'Allow-all messaging keys are forbidden. Configure the selected platform allowlist instead.' >&2; exit 1; }
-set_env_value "$key" "$value" "$env_file"
-systemctl try-restart hermes-gateway.service
-echo "Stored $key for hermes."
+if [[ $mode == --unset ]]; then
+  unset_env_value "$key" "$env_file"
+else
+  if [[ $mode == --stdin ]]; then
+    IFS= read -r value || [[ -n ${value:-} ]]
+  else
+    read -r -s -p "Value for $key: " value
+    printf '\n'
+  fi
+  [[ -n $value && $value != *$'\n'* && $value != *$'\r'* ]] || { echo 'A non-empty one-line value is required.' >&2; exit 1; }
+  if [[ $key == *_ALLOWED_USERS ]] && ! validate_explicit_allowlist "$value"; then
+    echo 'Wildcard allowlists are forbidden. List each authorized user explicitly.' >&2
+    exit 1
+  fi
+  if [[ $key == NETLIFY_AUTH_TOKEN || $key == TTS_API_KEY ]] && [[ ! $value =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo 'This key must contain only letters, digits, hyphens, or underscores.' >&2
+    exit 1
+  fi
+  forbid_allow_all_key "$key" || { echo 'Allow-all messaging keys are forbidden. Configure the selected platform allowlist instead.' >&2; exit 1; }
+  set_env_value "$key" "$value" "$env_file"
+  if [[ $key == NETLIFY_AUTH_TOKEN || $key == TTS_API_KEY ]]; then
+    ledger=/etc/hermes-kit/consents.json
+    tmp=$(mktemp "$ledger.XXXXXX")
+    jq --arg date "$(date -u +%F)" --arg integration "env:$key" '.consents = ((.consents // []) | map(select(.integration != $integration)) + [{client_name:"client",date:$date,integration:$integration,scopes:[$integration],risk_level:"RED",warnings_shown:"Client-owned key for approved action",confirmation:"client-setup"}])' "$ledger" > "$tmp"
+    chown root:root "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+  fi
+fi
+if [[ $restart == restart ]]; then systemctl try-restart hermes-gateway.service; fi
+echo "Updated $key for hermes."

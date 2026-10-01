@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import grp
 import hashlib
 import json
 import os
@@ -62,7 +63,11 @@ def event(kind: str, **fields):
     report = STATE / "access-log.txt"
     with report.open("a") as out:
         out.write(line)
-    report.chmod(0o644)
+    if os.geteuid() == 0 and os.environ.get("KIT_ACCESS_TEST_MODE") != "1":
+        report.chown(0, grp.getgrnam("hermes").gr_gid)
+        report.chmod(0o640)
+    else:
+        report.chmod(0o644)
 
 
 def record_full_downgrade(target_tier: str):
@@ -309,7 +314,7 @@ def menu(command: str):
                 raise ValueError("Value refused")
             if args[1] == "web.search_backend" and args[2] != "searxng":
                 raise ValueError("Value refused")
-    if op.startswith("powerup-") and args[1] not in {"builder", "website", "schedules", "logins"}:
+    if op.startswith("powerup-") and args[1] not in {"builder", "website", "netlify", "tailscale", "media", "schedules", "logins"}:
         raise ValueError("Power-up refused")
     if op == "model-set" and (args[1] not in MODEL_PROVIDERS or not re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", args[2])):
         raise ValueError("Model refused")

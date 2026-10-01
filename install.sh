@@ -59,6 +59,8 @@ fi
 source "$KIT_DIR/lib/common.sh"
 load_kit_config "$CONFIG_FILE"
 : "${CLIENT_NAME:=}"
+: "${ASSISTANT_NAME:=}"
+[[ -z $ASSISTANT_NAME || ( ${#ASSISTANT_NAME} -le 40 && -n ${ASSISTANT_NAME// /} && $ASSISTANT_NAME =~ ^[A-Za-z0-9\ \'-]+$ ) ]] || { echo 'ASSISTANT_NAME must be 1-40 letters, digits, spaces, apostrophes, or hyphens.' >&2; exit 1; }
 : "${OPS_SSH_PUBKEY:=}"
 : "${MODEL_PROVIDER:=opencode-zen}"
 : "${MODEL_NAME:=}"
@@ -89,6 +91,14 @@ if [[ $MESSAGING_PLATFORM == agentmail ]]; then
   validate_explicit_allowlist "$MAIL_ALLOWED_RECIPIENTS" || { echo 'MAIL_ALLOWED_RECIPIENTS must be an explicit non-wildcard list.' >&2; exit 1; }
 fi
 persist_kit_config "$CONFIG_FILE"
+KIT_SETUP_NEW_INSTALL=0
+if [[ ! -e /opt/hermes-kit/current ]]; then KIT_SETUP_NEW_INSTALL=1; fi
+export KIT_SETUP_NEW_INSTALL
+if [[ $KIT_SETUP_NEW_INSTALL == 1 && -n $OPS_SSH_PUBKEY && ! -e /var/lib/hermes-kit/setup-window/started-at && ! -e /var/lib/hermes-kit/setup-window/closed-at ]]; then
+  install -d -m 0700 /var/lib/hermes-kit/setup-window
+  date -u +%s > /var/lib/hermes-kit/setup-window/started-at
+  chmod 0600 /var/lib/hermes-kit/setup-window/started-at
+fi
 
 # Keep every installed release available after a temporary update checkout is
 # removed. Helpers and units must never point at the caller's working tree.

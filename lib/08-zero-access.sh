@@ -248,13 +248,12 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-for helper in kit-grant-access kit-revoke-access kit-handover kit-health kit-enroll kit-enroll-retry kit-report kit-downtime kit-expire-grants kit-autoupdate kit-set-support-key kit-manage-grant kit-manage-revoke kit-full-access kit-powerup; do ln -sfn "$KIT_RUNTIME_DIR/bin/$helper" "/usr/local/bin/$helper"; done
+for helper in kit-grant-access kit-revoke-access kit-handover kit-setup-window kit-health kit-enroll kit-enroll-retry kit-report kit-downtime kit-expire-grants kit-autoupdate kit-set-support-key kit-manage-grant kit-manage-revoke kit-full-access kit-powerup; do ln -sfn "$KIT_RUNTIME_DIR/bin/$helper" "/usr/local/bin/$helper"; done
 ln -sfn "$KIT_RUNTIME_DIR/bin/kit-manage-dispatch" /usr/local/sbin/kit-manage-dispatch
 systemctl daemon-reload
 systemctl enable --now hermes-kit-health.timer hermes-kit-autoupdate.timer hermes-kit-report-shutdown.service
 if [[ -f /var/lib/hermes-kit/report/enrolled-agent-id ]]; then systemctl enable --now hermes-kit-report.timer; fi
 systemctl start hermes-kit-health.service
 if [[ $SUPPORT_PLATFORM != none ]]; then systemctl enable --now hermes-support-gateway.service; fi
-if [[ $KIT_TIER == full && -n $OPS_SSH_PUBKEY ]] && ! compgen -G '/var/lib/hermes-kit/grants/*-cert.pub' >/dev/null; then
-  /usr/local/bin/kit-grant-access --public-key <(printf '%s\n' "$OPS_SSH_PUBKEY") --hours 8 --waiver setup-bootstrap --setup --bootstrap
-fi
+# shellcheck source=lib/setup-window-install.sh
+source "$KIT_DIR/lib/setup-window-install.sh"

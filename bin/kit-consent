@@ -2,25 +2,43 @@
 set -euo pipefail
 
 ledger=/etc/hermes-kit/consents.json
+ledger=${KIT_CONSENT_LEDGER:-$ledger}
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
 command=${1:-}
 integration=${2:-}
+mcp_server=
+mcp_platforms=cli
+if [[ $command == add ]]; then
+  shift $(( $# < 2 ? $# : 2 ))
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --mcp-server) mcp_server=${2:-}; shift 2 ;;
+      --platforms) mcp_platforms=${2:-}; shift 2 ;;
+      *) echo 'Usage: kit-consent add <integration> [--mcp-server name] [--platforms cli,telegram]' >&2; exit 2 ;;
+    esac
+  done
+fi
 
-[[ ${EUID} -eq 0 ]] || { echo 'kit-consent must run as root with the client present.' >&2; exit 1; }
-install -d -m 0700 /etc/hermes-kit
+[[ ${EUID} -eq 0 || ${KIT_POWERUP_TEST_MODE:-} == 1 ]] || { echo 'kit-consent must run as root with the client present.' >&2; exit 1; }
+install -d -m 0700 "$(dirname -- "$ledger")"
 [[ -f $ledger ]] || printf '{"consents":[]}\n' > "$ledger"
-chown root:root "$ledger"
+[[ ${KIT_POWERUP_TEST_MODE:-} == 1 ]] || chown root:root "$ledger"
 chmod 0600 "$ledger"
 
 case $command in
   list)
-    jq -r '.consents[] | [.date, .client_name, .integration, .risk_level, (.scopes | join(", "))] | @tsv' "$ledger"
+    jq -r '.consents[] | [.date, .client_name, .integration, .risk_level, (.scopes | join(", ")), (.mcp_server // ""), ((.mcp_platforms // []) | join(","))] | @tsv' "$ledger"
     ;;
   add)
     [[ -n $integration && $integration =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'Usage: kit-consent add <integration>' >&2; exit 1; }
+    case $integration in base|builder|website|schedules|logins) echo 'Use kit-powerup for this capability.' >&2; exit 1 ;; esac
+    [[ -z $mcp_server || $mcp_server =~ ^[A-Za-z][A-Za-z0-9_-]{0,63}$ ]] || { echo 'Invalid MCP server name.' >&2; exit 1; }
+    [[ -n $mcp_server || $mcp_platforms == cli ]] || { echo '--platforms requires --mcp-server.' >&2; exit 1; }
     read -r -p 'Client name: ' client_name
     read -r -p 'Scopes, comma-separated: ' scopes_raw
     read -r -p 'Risk level (GREEN, YELLOW, RED): ' risk_level
-    risk_level=${risk_level^^}
+    risk_level=$(printf '%s' "$risk_level" | tr '[:lower:]' '[:upper:]')
     [[ -n $client_name && -n $scopes_raw && $risk_level =~ ^(GREEN|YELLOW|RED)$ ]] || { echo 'Client name, scopes, and a valid risk level are required.' >&2; exit 1; }
     case $risk_level in
       GREEN) warning='Low impact, but the integration can still expose the selected data.' ;;
@@ -31,17 +49,38 @@ case $command in
     read -r -p 'Type exactly "I understand" to record consent: ' confirmation
     [[ $confirmation == 'I understand' ]] || { echo 'Consent not recorded.' >&2; exit 1; }
     scopes_json=$(printf '%s' "$scopes_raw" | jq -Rc 'split(",") | map(gsub("^ +| +$"; "")) | map(select(length > 0))')
+    platforms_json=$(printf '%s' "$mcp_platforms" | jq -Rc 'split(",") | map(gsub("^ +| +$"; "")) | map(select(length > 0)) | unique')
+    had_mcp=$(jq -r --arg integration "$integration" '.consents[]? | select(.integration == $integration) | .mcp_server // empty' "$ledger")
     tmp=$(mktemp "$ledger.XXXXXX")
-    jq --arg client_name "$client_name" --arg date "$(date -u +%F)" --arg integration "$integration" --arg risk_level "$risk_level" --arg warning "$warning" --arg confirmation "$confirmation" --argjson scopes "$scopes_json" \
-      '.consents = ((.consents // []) | map(select(.integration != $integration)) + [{client_name: $client_name, date: $date, integration: $integration, scopes: $scopes, risk_level: $risk_level, warnings_shown: $warning, confirmation: $confirmation}])' "$ledger" > "$tmp"
-    chown root:root "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+    jq --arg client_name "$client_name" --arg date "$(date -u +%F)" --arg integration "$integration" --arg risk_level "$risk_level" --arg warning "$warning" --arg confirmation "$confirmation" --arg mcp_server "$mcp_server" --argjson mcp_platforms "$platforms_json" --argjson scopes "$scopes_json" \
+      '.consents = ((.consents // []) | map(select(.integration != $integration)) + [{client_name: $client_name, date: $date, integration: $integration, scopes: $scopes, risk_level: $risk_level, warnings_shown: $warning, confirmation: $confirmation} + (if $mcp_server == "" then {} else {mcp_server: $mcp_server, mcp_platforms: $mcp_platforms} end)])' "$ledger" > "$tmp"
+    if [[ -n $mcp_server || -n $had_mcp ]] && ! python3 - "$kit_dir/lib" "$tmp" "$mcp_server" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from kit_powerup import apply_consent_candidate
+apply_consent_candidate(json.load(open(sys.argv[2])), sys.argv[3] or None)
+PY
+    then rm -f -- "$tmp"; exit 1; fi
+    [[ ${KIT_POWERUP_TEST_MODE:-} == 1 ]] || chown root:root "$tmp"
+    chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+    [[ -z $mcp_server && -z $had_mcp || ${KIT_POWERUP_TEST_MODE:-} == 1 ]] || systemctl restart hermes-gateway.service
     echo "Recorded consent for $integration."
     ;;
   remove)
     [[ -n $integration ]] || { echo 'Usage: kit-consent remove <integration>' >&2; exit 1; }
     tmp=$(mktemp "$ledger.XXXXXX")
     jq --arg integration "$integration" '.consents = ((.consents // []) | map(select(.integration != $integration)))' "$ledger" > "$tmp"
-    chown root:root "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+    had_mcp=$(jq -r --arg integration "$integration" '.consents[]? | select(.integration == $integration) | .mcp_server // empty' "$ledger")
+    if [[ -n $had_mcp ]] && ! python3 - "$kit_dir/lib" "$tmp" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from kit_powerup import apply_consent_candidate
+apply_consent_candidate(json.load(open(sys.argv[2])))
+PY
+    then rm -f -- "$tmp"; exit 1; fi
+    [[ ${KIT_POWERUP_TEST_MODE:-} == 1 ]] || chown root:root "$tmp"
+    chmod 0600 "$tmp"; mv "$tmp" "$ledger"
+    [[ -z $had_mcp || ${KIT_POWERUP_TEST_MODE:-} == 1 ]] || systemctl restart hermes-gateway.service
     echo "Removed consent for $integration. Disconnect the integration and remove its credential before verification."
     ;;
   *) echo 'Usage: kit-consent add|list|remove <integration>' >&2; exit 1 ;;

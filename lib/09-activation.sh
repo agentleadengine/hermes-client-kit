@@ -4,6 +4,7 @@ log 'Installing token-gated activation and support page'
 apt-get -y --no-install-recommends install caddy
 install -d -m 0700 /var/lib/agent-care/activation /var/lib/agent-care/support /var/lib/agent-care/home
 ln -sfn "$KIT_RUNTIME_DIR/bin/kit-activation" /usr/local/bin/kit-activation
+ln -sfn "$KIT_RUNTIME_DIR/activation/chat-connect.py" /usr/local/bin/kit-chat-connect
 ln -sfn "$KIT_RUNTIME_DIR/bin/kit-install-report" /usr/local/bin/kit-install-report
 install -m 0755 "$KIT_DIR/activation/activation-service.py" /usr/local/lib/hermes-kit-activation-service.py
 install -m 0644 "$KIT_DIR/activation/Caddyfile" /etc/caddy/Caddyfile
@@ -19,7 +20,7 @@ Restart=on-failure
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/agent-care /var/lib/hermes-kit /run
+ReadWritePaths=/etc/hermes-kit /home/hermes/.hermes /var/lib/agent-care /var/lib/hermes-kit /run
 
 [Install]
 WantedBy=multi-user.target

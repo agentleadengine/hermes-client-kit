@@ -4,16 +4,26 @@ set -euo pipefail
 state=${KIT_ACCESS_LOG_STATE:-/var/lib/hermes-kit}
 report=$state/access-log.txt
 events=$state/access-events.log
+auth_file=${KIT_ACCESS_LOG_AUTH_FILE:-/var/log/auth.log}
 since=${2:-}
 [[ ${1:-} == --since || -z ${1:-} ]] || { echo 'Usage: kit-access-log [--since DURATION]' >&2; exit 2; }
 [[ ${1:-} != --since || -n $since ]] || { echo 'Usage: kit-access-log [--since DURATION]' >&2; exit 2; }
-if [[ ${EUID} -eq 0 ]]; then
-  # Hermes needs only traversal to this directory and read access to this
-  # generated public metadata file.  It cannot list or read health/grant state.
-  install -d -m 0751 -o root -g root "$state"
-  { journalctl --no-pager -u ssh -u sshd -t sudo 2>/dev/null || true; [[ -f /var/log/auth.log ]] && grep -E 'sshd.*Accepted|sudo:' /var/log/auth.log || true; [[ -f $events ]] && cat "$events"; } | sort -u > "$report"
-  chown root:root "$report"
-  chmod 0644 "$report"
+if [[ ${EUID} -eq 0 || ${KIT_ACCESS_LOG_TEST_MODE:-} == 1 ]]; then
+  # The client and main Hermes user can read the report; the isolated support
+  # profile cannot read recorded terminal I/O or any other client data.
+  if [[ ${KIT_ACCESS_LOG_TEST_MODE:-} == 1 ]]; then install -d -m 0751 "$state"; else install -d -m 0751 -o root -g root "$state"; fi
+  report_tmp=$(mktemp "$state/.access-log.XXXXXX")
+  trap 'rm -f "$report_tmp"' EXIT
+  {
+    journalctl --no-pager --output=short-iso -u ssh -u sshd 2>/dev/null || true
+    journalctl --no-pager --output=short-iso -t sudo 2>/dev/null || true
+    journalctl --no-pager --output=short-iso TLOG_USER=hermes-setup TLOG_USER=hermes-ops 2>/dev/null || true
+    [[ -f $auth_file ]] && grep -E 'sshd.*Accepted|sudo:|tlog-rec-session' "$auth_file" || true
+    [[ -f $events ]] && cat "$events" || true
+  } | sort -u > "$report_tmp"
+  if [[ ${KIT_ACCESS_LOG_TEST_MODE:-} != 1 ]]; then chown root:hermes "$report_tmp"; fi
+  chmod 0640 "$report_tmp"
+  mv -f "$report_tmp" "$report"
 fi
 [[ -f $report ]] || { echo 'Access-log timer has not produced its first report yet.' >&2; exit 1; }
 if [[ -z $since ]]; then cat "$report"; exit 0; fi
@@ -24,9 +34,11 @@ else
 fi
 # Do not append the unfiltered cached report. Journal is filtered at source;
 # grant and handover events carry UTC timestamps and are filtered before print.
-journalctl --since "@$cutoff" --no-pager -u ssh -u sshd -t sudo 2>/dev/null || true
+journalctl --since "@$cutoff" --no-pager --output=short-iso -u ssh -u sshd 2>/dev/null || true
+journalctl --since "@$cutoff" --no-pager --output=short-iso -t sudo 2>/dev/null || true
+journalctl --since "@$cutoff" --no-pager --output=short-iso TLOG_USER=hermes-setup TLOG_USER=hermes-ops 2>/dev/null || true
 event_source=$events
-if (( EUID != 0 )); then event_source=$report; fi
+if (( EUID != 0 )) && [[ ${KIT_ACCESS_LOG_TEST_MODE:-} != 1 ]]; then event_source=$report; fi
 if [[ -f $event_source ]]; then
   while IFS= read -r line; do
     stamp=${line%% *}

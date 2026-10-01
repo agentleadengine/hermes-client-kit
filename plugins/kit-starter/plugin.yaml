@@ -1,0 +1,15 @@
+name: kit-starter
+version: "1.0"
+description: Client-owned website, video, and Builder tools with consent and approval gates.
+provides_hooks:
+  - pre_tool_call
+provides_tools:
+  - starter_site_preview
+  - starter_site_publish
+  - starter_site_undo
+  - starter_make_video
+  - starter_video_share
+  - starter_tool_prepare
+  - starter_tool_stage
+  - starter_tool_publish
+  - starter_tool_rollback

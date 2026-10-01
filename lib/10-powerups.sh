@@ -54,6 +54,11 @@ Persistent=true
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
+if [[ -f /etc/hermes-kit/consents.json ]] && jq -e '.consents[]? | select(.integration == "website")' /etc/hermes-kit/consents.json >/dev/null; then
+  systemctl enable --now hermes-kit-website-preview.service
+else
+  systemctl disable --now hermes-kit-website-preview.service 2>/dev/null || true
+fi
 python3 - "$KIT_RUNTIME_DIR/lib" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -73,10 +78,12 @@ fi
 python3 - "$KIT_RUNTIME_DIR/lib" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
-from kit_powerup import apply_policy, consents, install_logins
+from kit_powerup import apply_policy, consents, install_logins, install_starter
 enabled = {entry.get("integration") for entry in consents().get("consents", [])}
 if "logins" in enabled:
     install_logins()
+if enabled & {"builder", "website", "media"}:
+    install_starter()
 apply_policy(enabled)
 PY
 if [[ -f /etc/hermes-kit/consents.json ]] && jq -e '.consents[]? | select(.integration == "builder")' /etc/hermes-kit/consents.json >/dev/null; then

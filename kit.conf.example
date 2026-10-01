@@ -1,7 +1,9 @@
 # Copy to kit.conf (or /etc/hermes-kit/kit.conf on cloud-init hosts) before install.
 # Never commit a populated kit.conf.
 CLIENT_NAME=""
-# Optional. Leave empty for Care tier, which has no operator key or standing access.
+ASSISTANT_NAME=""
+# Optional. On a new install, Sam's key opens a recorded 48-hour setup SSH window on every tier.
+# Empty means no setup window. Reinstalling never extends or reopens a closed window.
 OPS_SSH_PUBKEY=""
 # Intake accepts openai-codex, opencode-zen, or openai-compatible (mapped to Hermes custom).
 MODEL_PROVIDER="opencode-zen"

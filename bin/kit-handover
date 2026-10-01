@@ -5,8 +5,36 @@ kit_dir=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 source "$kit_dir/lib/sshd-transaction.sh"
 
 [[ ${EUID} -eq 0 ]] || { echo 'kit-handover must run as root with the client present.' >&2; exit 1; }
-read -r -p 'Confirm the client has independent access. Type HANDOVER: ' confirmation
-[[ $confirmation == HANDOVER ]] || { echo 'Handover cancelled.' >&2; exit 1; }
+if [[ ${1:-} == --confirmed && $# -eq 1 ]]; then
+  confirmation=HANDOVER
+else
+  [[ $# -eq 0 ]] || { echo 'Usage: kit-handover' >&2; exit 2; }
+  read -r -p 'Confirm the client has independent access. Type HANDOVER: ' confirmation
+  [[ $confirmation == HANDOVER ]] || { echo 'Handover cancelled.' >&2; exit 1; }
+fi
+if [[ ${SUDO_USER:-} == hermes-setup && $# -eq 0 ]]; then
+  # Closing the caller's own login would interrupt cleanup. Run it outside
+  # that login's logind session, then the service can terminate the session.
+  systemd-run --unit="hermes-kit-handover-$(date -u +%s)-$$" --collect --no-block "$kit_dir/bin/kit-handover" --confirmed
+  echo 'Handover started; the setup SSH session will close.'
+  exit 0
+fi
+"$(dirname "$(readlink -f "$0")")/kit-setup-window" close
+# Full Service access is a separate standing, waiver-bound client decision.
+kit_config=${KIT_CONFIG:-/etc/hermes-kit/kit.conf}
+KIT_TIER=care
+if [[ -f $kit_config ]]; then
+  # shellcheck source=../lib/common.sh
+  source "$kit_dir/lib/common.sh"
+  load_kit_config "$kit_config"
+fi
+[[ $KIT_TIER == ludicrous ]] && KIT_TIER=full
+if [[ $KIT_TIER == full ]]; then
+  printf '%s handover-complete setup-closed=yes tier=full\n' "$(date -u +%FT%TZ)" >> /var/lib/hermes-kit/access-events.log
+  "$kit_dir/bin/kit-verify" --tier full
+  echo 'Handover proof: setup account, key, sudo rule, and SSH policy removed.'
+  exit 0
+fi
 for certificate in /var/lib/hermes-kit/grants/*-cert.pub; do
   [[ -e $certificate ]] || continue
   grant_id=${certificate##*/}
@@ -29,5 +57,5 @@ systemctl disable --now hermes-kit-grant-cleanup.timer 2>/dev/null || true
 sshd -t
 systemctl reload ssh || systemctl restart ssh.socket
 printf '%s handover-complete no-ops-account=no-ops-principal=no-active-cert-required=no\n' "$(date -u +%FT%TZ)" >> /var/lib/hermes-kit/access-events.log
-"$(dirname "$(readlink -f "$0")")/kit-verify" --tier care
+"$(dirname "$(readlink -f "$0")")/kit-verify" --tier "$KIT_TIER"
 echo 'Handover proof: no operator account, sudoers grant, accepted ops principal, or active grant timer remains.'

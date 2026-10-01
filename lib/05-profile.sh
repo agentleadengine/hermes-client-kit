@@ -1,22 +1,42 @@
 #!/usr/bin/env bash
 
 log 'Installing the Hermes profile distribution and client-profile baseline'
-if [[ -f "$HERMES_HOME/distribution.yaml" ]]; then
-  # The marker is the documented opt-out state. It must exist before the
-  # distribution update so Hermes never re-seeds its bundled catalog.
-  touch "$HERMES_HOME/.no-bundled-skills"
-  chown "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/.no-bundled-skills"
-  chmod 0600 "$HERMES_HOME/.no-bundled-skills"
+profile_source=/var/lib/hermes-kit/profile-source
+# Hermes records the absolute source directory in distribution.yaml. Keep that
+# directory stable across kit releases and render the name before Hermes reads it.
+install -d -m 0755 /var/lib/hermes-kit
+rm -rf -- "$profile_source"
+install -d -m 0755 "$profile_source"
+cp -a "$KIT_DIR/profile/." "$profile_source/"
+python3 "$KIT_DIR/lib/kit_profile.py" install "$KIT_DIR/profile" "$profile_source" "${ASSISTANT_NAME:-}"
+chmod -R a+rX "$profile_source"
+
+# The marker must precede update/install so Hermes does not seed bundled skills.
+install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" "$HERMES_HOME"
+touch "$HERMES_HOME/.no-bundled-skills"
+chown "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/.no-bundled-skills"
+chmod 0600 "$HERMES_HOME/.no-bundled-skills"
+if [[ -f "$HERMES_HOME/distribution.yaml" ]] && grep -Fqx "source: $profile_source" "$HERMES_HOME/distribution.yaml"; then
   run_as_hermes_root "'$HERMES_BIN' profile update '$HERMES_PROFILE_NAME' --yes"
 else
-  run_as_hermes_root "'$HERMES_BIN' profile install '$KIT_DIR/profile' --name '$HERMES_PROFILE_NAME' --yes"
-  # A non-interactive profile install seeds bundled skills. Opt out before any
-  # later profile update or skill sync, then remove the unconsented seeded set.
-  touch "$HERMES_HOME/.no-bundled-skills"
-  chown "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/.no-bundled-skills"
-  chmod 0600 "$HERMES_HOME/.no-bundled-skills"
+  # Recover interrupted/old installs with no source record. Hermes --force
+  # refreshes distribution files but also replaces config, so keep client config.
+  profile_config_backup=
+  if [[ -f "$HERMES_HOME/config.yaml" ]]; then
+    profile_config_backup=$(mktemp)
+    cp -p "$HERMES_HOME/config.yaml" "$profile_config_backup"
+  fi
+  run_as_hermes_root "'$HERMES_BIN' profile install '$profile_source' --name '$HERMES_PROFILE_NAME' --force --yes"
+  if [[ -n $profile_config_backup ]]; then
+    cp -p "$profile_config_backup" "$HERMES_HOME/config.yaml"
+    chown "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/config.yaml"
+    rm -f "$profile_config_backup"
+  fi
 fi
 run_as_hermes_root "'$HERMES_BIN' profile use '$HERMES_PROFILE_NAME'"
+install -m 0644 -o "$HERMES_USER" -g "$HERMES_USER" "$KIT_DIR/profile/GUIDE.md" "$HERMES_HOME/GUIDE.md"
+install -m 0644 -o "$HERMES_USER" -g "$HERMES_USER" "$KIT_DIR/profile/NOTICE" "$HERMES_HOME/NOTICE"
+chown -R "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/SOUL.md" "$HERMES_HOME/distribution.yaml" "$HERMES_HOME/SKILLS.sha256" "$HERMES_HOME/skills/hermes/hermes-starter-onboarding/SKILL.md"
 install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" "$HERMES_HOME/plugins"
 if [[ -f /etc/hermes-kit/kit-logins.installed && -d "$HERMES_HOME/plugins/kit-logins" ]]; then
   chmod 0755 "$HERMES_HOME/plugins/kit-logins"
@@ -77,5 +97,8 @@ if [[ $MESSAGING_PLATFORM == agentmail ]]; then
 fi
 if [[ -n $messaging_allowlist_key ]] && ! grep -Eq "^${messaging_allowlist_key}=" "$HERMES_HOME/.env"; then
   set_env_value "$messaging_allowlist_key" "$messaging_allowlist_value" "$HERMES_HOME/.env"
+fi
+if [[ $MESSAGING_PLATFORM == photon ]]; then
+  set_env_value PHOTON_NODE_BIN /home/hermes/.hermes/node/bin/node "$HERMES_HOME/.env"
 fi
 install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" /home/hermes/vault

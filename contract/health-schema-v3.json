@@ -220,25 +220,8 @@
    "maxItems": 50,
    "uniqueItems": true,
    "items": {
-    "enum": [
-     "agentmail",
-     "opencode-zen",
-     "opencode-go",
-     "ollama-cloud",
-     "openrouter",
-     "photon",
-     "telegram",
-     "whatsapp",
-     "signal",
-     "slack",
-     "notion",
-     "google-workspace",
-     "github",
-     "dropbox",
-     "box",
-     "linear",
-     "cloudflare"
-    ]
+    "type": "string",
+    "pattern": "^[A-Za-z0-9._-]{1,40}$"
    }
   },
   "cron": {
@@ -328,14 +311,17 @@
   "power_ups": {
    "type": "array",
    "uniqueItems": true,
-   "maxItems": 5,
+   "maxItems": 8,
    "items": {
     "enum": [
      "base",
      "builder",
      "website",
      "logins",
-     "schedules"
+     "schedules",
+     "netlify",
+     "tailscale",
+     "media"
     ]
    }
   },
@@ -401,7 +387,10 @@
     },
     "team_key_fingerprints": {
      "type": "array",
-     "items": {"type": "string", "pattern": "^SHA256:[A-Za-z0-9+/=]{32,64}$"},
+     "items": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/=]{32,64}$"
+     },
      "uniqueItems": true
     }
    },

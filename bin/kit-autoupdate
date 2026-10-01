@@ -90,28 +90,30 @@ backup_dir=$(mktemp -d /var/backups/hermes-kit/autoupdate.XXXXXX)
 backup="$backup_dir/affected-components.tgz"
 ssh_snapshot="$backup_dir/ssh-config"
 install -d -m 0700 "$ssh_snapshot"
-for ssh_name in 00-hermes-kit.conf 10-hermes-kit-access.conf 11-hermes-kit-manager.conf 99-hermes-kit.conf; do
+for ssh_name in 00-hermes-kit.conf 10-hermes-kit-access.conf 11-hermes-kit-manager.conf 12-hermes-kit-setup.conf 99-hermes-kit.conf; do
   [[ ! -f /etc/ssh/sshd_config.d/$ssh_name ]] || cp -p "/etc/ssh/sshd_config.d/$ssh_name" "$ssh_snapshot/$ssh_name"
 done
 readlink -f /opt/hermes-kit/current > "$backup_dir/current-target" 2>/dev/null || true
-getent passwd hermes hermes-support hermes-ops ops > "$backup_dir/passwd" || true
-getent shadow hermes hermes-support hermes-ops ops > "$backup_dir/shadow" || true
+getent passwd hermes hermes-support hermes-ops hermes-setup ops > "$backup_dir/passwd" || true
+getent shadow hermes hermes-support hermes-ops hermes-setup ops > "$backup_dir/shadow" || true
 tar -C / -czf "$backup" --ignore-failed-read \
   opt/hermes-kit etc/hermes etc/hermes-kit etc/systemd/system/hermes-support-gateway.service \
   etc/systemd/system/hermes-kit-health.service etc/systemd/system/hermes-kit-health.timer \
   etc/systemd/system/hermes-kit-report.service etc/systemd/system/hermes-kit-report.timer \
   etc/systemd/system/hermes-kit-report-shutdown.service \
   etc/systemd/system/hermes-kit-grant-cleanup.service etc/systemd/system/hermes-kit-grant-cleanup.timer \
+  etc/systemd/system/hermes-kit-setup-expiry.service etc/systemd/system/hermes-kit-setup-expiry.timer \
   etc/systemd/system/hermes-kit-autoupdate.service etc/systemd/system/hermes-kit-autoupdate.timer \
   etc/ssh/kit etc/ssh/auth_principals etc/ssh/sshd_config.d/00-hermes-kit.conf \
   etc/ssh/sshd_config.d/10-hermes-kit-access.conf etc/sudoers.d/90-hermes-kit-ops \
-  etc/sudoers.d/90-hermes-kit-hermes-ops home/hermes/.hermes/profiles/client var/lib/hermes-support
+  etc/sudoers.d/90-hermes-kit-hermes-ops etc/ssh/kit-setup.keys \
+  etc/sudoers.d/92-hermes-kit-setup home/hermes/.hermes/profiles/client var/lib/hermes-support
 
 rollback() {
   tar -C / -xzf "$backup" --exclude='etc/ssh/sshd_config.d/*'
   local -a ssh_restore=()
   local ssh_name
-  for ssh_name in 00-hermes-kit.conf 10-hermes-kit-access.conf 11-hermes-kit-manager.conf 99-hermes-kit.conf; do
+  for ssh_name in 00-hermes-kit.conf 10-hermes-kit-access.conf 11-hermes-kit-manager.conf 12-hermes-kit-setup.conf 99-hermes-kit.conf; do
     if [[ -f $ssh_snapshot/$ssh_name ]]; then
       ssh_restore+=("/etc/ssh/sshd_config.d/$ssh_name" "$ssh_snapshot/$ssh_name")
     else
@@ -119,8 +121,10 @@ rollback() {
     fi
   done
   sshd_files_apply "${ssh_restore[@]}" || return 1
-  for account in hermes hermes-support hermes-ops ops; do
-    grep -q "^$account:" "$backup_dir/passwd" || { id -u "$account" >/dev/null 2>&1 && userdel --remove "$account" || true; }
+  for account in hermes hermes-support hermes-ops hermes-setup ops; do
+    if ! grep -q "^$account:" "$backup_dir/passwd" && id -u "$account" >/dev/null 2>&1; then
+      if [[ $account == hermes-setup ]]; then userdel "$account" || true; else userdel --remove "$account" || true; fi
+    fi
   done
   while IFS=: read -r name _ uid gid _ home shell; do
     id -u "$name" >/dev/null 2>&1 || useradd -u "$uid" -g "$gid" -d "$home" -s "$shell" -M "$name"

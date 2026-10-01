@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Join a client's tailnet using a one-use key read only from stdin."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import termios
+
+CONFIG = Path(os.environ.get("KIT_TAILSCALE_CONFIG", "/etc/tailscale/tailscaled.json"))
+KEY = Path(os.environ.get("KIT_TAILSCALE_KEY", "/run/hermes-kit/tailscale-auth.key"))
+LEDGER = Path(os.environ.get("KIT_TAILSCALE_LEDGER", "/etc/hermes-kit/consents.json"))
+TEST = os.environ.get("KIT_TAILSCALE_TEST_MODE") == "1"
+
+
+def run(*args, capture=False):
+    return subprocess.run(list(args), check=True, capture_output=capture, text=True)
+
+
+def has_funnel(config):
+    if not isinstance(config, dict):
+        return False
+    if any(value is True for value in config.get("AllowFunnel", {}).values()):
+        return True
+    return any(has_funnel(child) for child in config.get("Foreground", {}).values())
+
+
+def require():
+    if os.geteuid() != 0 and not TEST:
+        raise ValueError("Run as root with the client present")
+    if not LEDGER.exists() or not any(x.get("integration") == "tailscale" for x in json.loads(LEDGER.read_text()).get("consents", [])):
+        raise ValueError("Tailscale consent is missing")
+
+
+def join():
+    require()
+    if not TEST:
+        status = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
+        if status.returncode == 0 and json.loads(status.stdout).get("BackendState") == "Running":
+            raise ValueError("This server is already joined; leave the existing tailnet first")
+    if sys.stdin.isatty():
+        print("Paste the client's one-use Tailscale auth key, then press Enter:", file=sys.stderr)
+        settings = termios.tcgetattr(sys.stdin.fileno())
+        hidden = termios.tcgetattr(sys.stdin.fileno())
+        hidden[3] &= ~termios.ECHO
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, hidden)
+            key = sys.stdin.readline().strip()
+        finally:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, settings)
+            print(file=sys.stderr)
+    else:
+        key = sys.stdin.readline().strip()
+    if not re.fullmatch(r"tskey-[A-Za-z0-9_-]{10,}", key):
+        raise ValueError("A Tailscale auth key is required on stdin")
+    KEY.parent.mkdir(parents=True, exist_ok=True)
+    KEY.write_text(key + "\n")
+    KEY.chmod(0o600)
+    data = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    data.update({"enabled": True, "locked": False, "authKey": "file:" + str(KEY)})
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(data) + "\n")
+    CONFIG.chmod(0o600)
+    try:
+        run("systemctl", "restart", "tailscaled.service")
+        if not TEST:
+            for _ in range(20):
+                status = json.loads(run("tailscale", "status", "--json", capture=True).stdout)
+                if status.get("BackendState") == "Running":
+                    break
+                time.sleep(1)
+            else:
+                raise ValueError("Tailscale did not join the client tailnet")
+            run("tailscale", "serve", "reset")
+            if any(x.get("integration") == "website" for x in json.loads(LEDGER.read_text()).get("consents", [])):
+                preview()
+    finally:
+        KEY.unlink(missing_ok=True)
+        data.pop("authKey", None)
+        CONFIG.write_text(json.dumps(data) + "\n")
+        CONFIG.chmod(0o600)
+        if not TEST:
+            run("tailscale", "debug", "reload-config")
+    print("Tailscale joined the client's tailnet" if not TEST else "Tailscale join configured")
+
+
+def serve(port: int):
+    require()
+    if port < 8801 or port > 8999:
+        raise ValueError("Only local client tool ports 8801-8999 may be served")
+    if not any(x.get("integration") == "builder" for x in json.loads(LEDGER.read_text()).get("consents", [])):
+        raise ValueError("Builder consent is missing")
+    configuration = json.loads(run("tailscale", "serve", "status", "--json", capture=True).stdout or "{}")
+    if has_funnel(configuration):
+        raise ValueError("Public Tailscale Funnel is active; private serving refused")
+    registry = Path("/srv/tools/registry.json")
+    if not registry.exists() or not any(x.get("port") == port and x.get("up") is True for x in json.loads(registry.read_text()).get("tools", [])):
+        raise ValueError("Only a published and running client tool may be served")
+    run("tailscale", "serve", "--bg", f"--http={port}", f"http://127.0.0.1:{port}")
+    print("Tool is available inside the client tailnet")
+
+
+def preview():
+    require()
+    if not any(x.get("integration") == "website" for x in json.loads(LEDGER.read_text()).get("consents", [])):
+        raise ValueError("Website consent is missing")
+    status = json.loads(run("tailscale", "status", "--json", capture=True).stdout)
+    if status.get("BackendState") != "Running":
+        raise ValueError("Client tailnet is not connected")
+    configuration = json.loads(run("tailscale", "serve", "status", "--json", capture=True).stdout or "{}")
+    if has_funnel(configuration):
+        raise ValueError("Public Tailscale Funnel is active; private preview refused")
+    run("tailscale", "serve", "--bg", "--http=8899", "http://127.0.0.1:8899")
+    address = status.get("Self", {}).get("DNSName", "").rstrip(".")
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", address):
+        raise ValueError("Tailscale did not provide a private device name")
+    print(f"Private website preview: http://{address}:8899")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("join", "serve", "preview", "status", "down"))
+    parser.add_argument("port", nargs="?", type=int)
+    args = parser.parse_args()
+    if args.action == "join":
+        join()
+    elif args.action == "serve":
+        if args.port is None:
+            parser.error("serve needs a local tool port")
+        serve(args.port)
+    elif args.action == "preview":
+        preview()
+    elif args.action == "status":
+        run("tailscale", "status")
+    else:
+        require()
+        run("tailscale", "serve", "reset")
+        run("tailscale", "down")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

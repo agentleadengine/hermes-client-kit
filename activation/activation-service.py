@@ -6,9 +6,11 @@ import html
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -17,7 +19,9 @@ STATE = Path("/var/lib/agent-care/activation")
 SUPPORT = Path("/var/lib/agent-care/support")
 HOME = Path("/var/lib/agent-care/home")
 REPORT_STATE = Path("/var/lib/hermes-kit/report")
+SETUP_STATE = Path("/var/lib/hermes-kit/setup-window")
 SAFE_DURATION = {"1", "2", "8", "24"}
+CHAT_ACTIONS = {"chat-connect", "chat-skip", "chat-disconnect"}
 
 def read(path, default=""):
     try: return path.read_text(encoding="utf-8").strip()
@@ -41,6 +45,75 @@ def config_value(name):
             return line.split("=", 1)[1].strip().strip("\"'")
     return ""
 
+def new_chat_nonce(token):
+    directory = STATE / "chat-nonces"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    nonce = secrets.token_hex(24)
+    path = directory / nonce
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        output.write(hashlib.sha256(token.encode()).hexdigest() + " " + str(int(time.time()) + 900))
+    return nonce
+
+def consume_chat_nonce(token, nonce):
+    if not re.fullmatch(r"[0-9a-f]{48}", nonce): return False
+    path = STATE / "chat-nonces" / nonce
+    try:
+        content = path.read_text(encoding="utf-8")
+        path.unlink()
+        expected, expiry = content.split(" ", 1)
+        return hmac.compare_digest(expected, hashlib.sha256(token.encode()).hexdigest()) and expiry.isdigit() and int(expiry) >= time.time()
+    except (FileNotFoundError, ValueError):
+        return False
+
+def chat_section(token, route, nonce):
+    action = f"/{route}/{token}/chat-connect"
+    hidden = f'<input type="hidden" name="nonce" value="{nonce}">'
+    current = config_value("MESSAGING_PLATFORM") or "none"
+    status = {"telegram": "Telegram", "photon": "iMessage"}.get(current, "No chat app")
+    section = '<section><h2>Connect your chat app</h2><p>Current connection: <strong>' + status + '</strong>. Choose an app, or skip for now. You can change this later in Assistant Home.</p>'
+    if current == "photon":
+        line = read(Path("/var/lib/hermes-kit/chat-line.txt"))
+        if re.fullmatch(r"\+[1-9]\d{6,14}", line):
+            section += '<p>Text your assistant at <strong>' + html.escape(line) + '</strong> from your iPhone.</p>'
+    section += f'<h3>Telegram</h3><p>Create a bot with <a href="https://t.me/BotFather" rel="noreferrer">@BotFather</a>. Open your bot and tap Start before connecting. Get your numeric ID from <a href="https://t.me/userinfobot" rel="noreferrer">@userinfobot</a>.</p><form method="post" action="{action}">{hidden}<input type="hidden" name="platform" value="telegram"><p><label>Bot token <input name="bot_token" type="password" autocomplete="off" required size="50"></label></p><p><label>Your numeric Telegram user ID <input name="telegram_user_id" inputmode="numeric" pattern="[0-9]{{5,15}}" required></label></p><button>Connect Telegram</button></form>'
+    section += f'<h3>iMessage via Photon</h3><p>Find your Spectrum project ID and project secret in your <a href="https://app.photon.codes/" rel="noreferrer">Photon dashboard</a>.</p><form method="post" action="{action}">{hidden}<input type="hidden" name="platform" value="photon"><p><label>Photon project ID <input name="project_id" autocomplete="off" required></label></p><p><label>Photon project secret <input name="project_secret" type="password" autocomplete="off" required size="50"></label></p><p><label>Your iMessage phone (international +country code and number) <input name="phone" type="tel" autocomplete="off" placeholder="+15551234567" required></label></p><button>Connect iMessage</button></form>'
+    section += f'<form method="post" action="/{route}/{token}/chat-skip">{hidden}<button>Skip for now</button></form>'
+    if route == "home" and current != "none":
+        section += f'<form method="post" action="/home/{token}/chat-disconnect">{hidden}<button>Disconnect chat app</button></form>'
+    return section + '</section>'
+
+def chat_result(fields, route):
+    part = route
+    platform = fields.get("platform", [""])[0]
+    if part == "chat-disconnect": platform = "none"
+    data = {"platform": platform}
+    if platform == "telegram":
+        data.update(bot_token=fields.get("bot_token", [""])[0], telegram_user_id=fields.get("telegram_user_id", [""])[0])
+    elif platform == "photon":
+        data.update(project_id=fields.get("project_id", [""])[0], project_secret=fields.get("project_secret", [""])[0], phone=fields.get("phone", [""])[0])
+    try:
+        result = subprocess.run(["/usr/local/bin/kit-chat-connect"], input=json.dumps(data), text=True,
+                                capture_output=True, timeout=240, check=False)
+        payload = json.loads(result.stdout)
+        if result.returncode == 0 and isinstance(payload, dict) and isinstance(payload.get("ok"), bool) and isinstance(payload.get("message"), str):
+            message = payload["message"]
+            for key in ("bot_token", "project_secret"):
+                for secret in fields.get(key, []):
+                    if secret: message = message.replace(secret, "[REDACTED]")
+            return payload["ok"], message[:500]
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        pass
+    return False, "The chat connection could not be completed. Please try again or contact your setup guide."
+
+
+def chat_message_html(message):
+    link = re.search(r"https://spectrum\.photon\.codes/users/[A-Za-z0-9_-]{1,128}/redirect\?msg=Hi\b", message)
+    if not link:
+        return html.escape(message)
+    return (html.escape(message[:link.start()]) + '<a href="' + html.escape(link.group(), quote=True)
+            + '" rel="noreferrer">Tap to text Hi</a>' + html.escape(message[link.end():]))
+
 def enrollment_notice():
     words = read(STATE / "fingerprint-words")
     if (REPORT_STATE / "enrolled-agent-id").is_file() and words:
@@ -53,6 +126,19 @@ def page(title, body):
 def form(token, action, label, fields=""):
     return f'<form method="post" action="/home/{token}/{action}">{fields}<button>{html.escape(label)}</button></form>'
 
+def setup_until():
+    expiry = read(SETUP_STATE / "expires-at")
+    if (SETUP_STATE / "closed-at").exists() or not expiry.isdigit() or int(expiry) <= int(time.time()):
+        return ""
+    return datetime.fromtimestamp(int(expiry), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def setup_nonce(token, bucket=None):
+    if bucket is None: bucket = int(time.time()) // 300
+    return hmac.new(token.encode(), f"finish-setup:{bucket}".encode(), hashlib.sha256).hexdigest()
+
+def finish_setup_form(token, route):
+    return f'<form method="post" action="/{route}/{token}/finish-setup"><input type="hidden" name="nonce" value="{setup_nonce(token)}"><button>Finish setup</button></form>'
+
 def home_page(token):
     try: health_raw = Path("/var/lib/hermes-kit/health.json").read_text(encoding="utf-8")
     except FileNotFoundError: health_raw = "{}"
@@ -64,8 +150,12 @@ def home_page(token):
     tools = health.get("tools", [])
     section = enrollment_notice()
     section += '<p>This page closes after 2 hours. Only someone with this link can use it. Keep the link private.</p>'
+    section += chat_section(token, "home", new_chat_nonce(token))
     section += '<section><h2>What Sam can see</h2><p>This is the exact last health payload sent from your server. It does not include chats, files or tool data.</p><pre>' + html.escape(health_raw) + '</pre></section>'
     section += f'<section><h2>Your plan and team access</h2><p>Plan: <strong>{html.escape(tier.title())}</strong>. Manager key present: {str(bool(access.get("manager_key_present"))).lower()}. Full access active: {str(bool(access.get("full_access_active"))).lower()}.</p>'
+    until = setup_until()
+    if until:
+        section += '<p>Sam’s temporary setup access expires at ' + html.escape(until) + ' UTC.</p>' + finish_setup_form(token, "home")
     if tier == "managed":
         section += form(token, "manager-grant", "Give team manager access", '<label>Team Ed25519 public key<br><textarea name="public_key" rows="3" required></textarea></label>')
         section += form(token, "manager-revoke", "Remove manager access", '<p>Removes every manager key and ends manager sessions.</p>')
@@ -119,7 +209,8 @@ class Handler(BaseHTTPRequestHandler):
         token = self.token(STATE, "/activate")
         if token:
             log = html.escape(read(STATE / "codex-device.log")[-4000:])
-            self.send_html(200, "Activate your private Hermes agent", enrollment_notice() + f"<p>Sign in with your own ChatGPT account. This page never displays agent data.</p><form method=post action='/activate/{token}/codex'><button>Show ChatGPT device code</button></form><pre>{log}</pre><form method=post action='/activate/{token}/complete'><button>Finish activation and close this page</button></form>")
+            setup_button = finish_setup_form(token, "activate") if setup_until() else ""
+            self.send_html(200, "Activate your private Hermes agent", enrollment_notice() + f"<p>Sign in with your own ChatGPT account. This page never displays agent data.</p><form method=post action='/activate/{token}/codex'><button>Show ChatGPT device code</button></form><pre>{log}</pre>" + chat_section(token, "activate", new_chat_nonce(token)) + f"{setup_button}<form method=post action='/activate/{token}/complete'><button>Finish activation and close this page</button></form>")
             return
         token = self.token(SUPPORT, "/support")
         if token:
@@ -128,6 +219,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_html(404, "Unavailable", "<p>This private page is unavailable.</p>")
     def do_POST(self):
+        path = urlparse(self.path).path
+        if path.endswith("/finish-setup"):
+            route = "home" if path.startswith("/home/") else "activate" if path.startswith("/activate/") else ""
+            token = self.token(HOME if route == "home" else STATE, "/" + route) if route else None
+            length = int(self.headers.get("Content-Length", "0"))
+            if not token or not re.fullmatch(r"/" + route + r"/[A-Fa-f0-9]{64}/finish-setup", path) or length < 0 or length > 1024:
+                self.send_html(404, "Unavailable", "<p>This private page is unavailable.</p>"); return
+            nonce = parse_qs(self.rfile.read(length).decode("utf-8")).get("nonce", [""])[0]
+            bucket = int(time.time()) // 300
+            if not any(hmac.compare_digest(nonce, setup_nonce(token, candidate)) for candidate in (bucket, bucket - 1)):
+                self.send_html(403, "Request refused", "<p>Refresh the page and try again.</p>"); return
+            if not setup_until() or not action(["/usr/local/bin/kit-setup-window", "close"]):
+                self.send_html(409, "Setup access was not closed", "<p>Check the server’s access log.</p>"); return
+            self.send_html(200, "Setup finished", "<p>Sam’s temporary setup access has been removed.</p>"); return
+        part = path.split("/")[-1]
+        if part in CHAT_ACTIONS:
+            home_token = self.token(HOME, "/home") if path.startswith("/home/") else None
+            activation_token = self.token(STATE, "/activate") if path.startswith("/activate/") else None
+            token = home_token or activation_token
+            if not token or (part == "chat-disconnect" and not home_token):
+                self.send_html(404, "Unavailable", "<p>This private page is unavailable.</p>"); return
+            try: length = int(self.headers.get("Content-Length", "0"))
+            except ValueError: length = -1
+            if length < 0 or length > 4096:
+                self.send_html(413, "Request too large", "<p>Please use shorter entries.</p>"); return
+            try: fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+            except UnicodeDecodeError:
+                self.send_html(400, "Invalid form", "<p>Please try again.</p>"); return
+            if not consume_chat_nonce(token, fields.get("nonce", [""])[0]):
+                self.send_html(403, "Page expired", "<p>Refresh this page and try again.</p>"); return
+            if part == "chat-skip":
+                ok, message = True, "You can connect your chat app later in Assistant Home."
+            else:
+                ok, message = chat_result(fields, part)
+            route = "home" if home_token else "activate"
+            self.send_html(200 if ok else 409, "Chat connection" if ok else "Chat connection needs attention",
+                           f'<p>{chat_message_html(message)}</p><p><a href="/{route}/{token}">Back to {"Assistant Home" if home_token else "activation"}</a></p>')
+            return
         token = self.token(HOME, "/home")
         if token:
             part = urlparse(self.path).path.split("/")[-1]

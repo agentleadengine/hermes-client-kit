@@ -62,6 +62,9 @@ class Handler(BaseHTTPRequestHandler):
     def authorized(self):
         try:
             cfg = json.loads(ACCESS.read_text())
+            if cfg.get("mode") == "tailscale":
+                login = self.headers.get("Tailscale-User-Login", "")
+                return bool(login and len(login) <= 320 and "\n" not in login and "\r" not in login)
             certs = json.loads(CERTS.read_text())
             age = __import__("time").time() - certs["fetched_at"]
             if not 0 <= age <= 86400:

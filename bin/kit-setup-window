@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+kit_dir=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=../lib/sshd-transaction.sh
+source "$kit_dir/lib/sshd-transaction.sh"
+[[ ${EUID} -eq 0 || ${KIT_SETUP_TEST_MODE:-} == 1 ]] || { echo 'kit-setup-window must run as root.' >&2; exit 1; }
+root=${KIT_SETUP_TEST_ROOT:-}
+[[ -z $root || ${KIT_SETUP_TEST_MODE:-} == 1 ]] || exit 1
+state=$root/var/lib/hermes-kit/setup-window
+events=$root/var/lib/hermes-kit/access-events.log
+key_file=$root/etc/ssh/kit-setup.keys
+sudo_file=$root/etc/sudoers.d/92-hermes-kit-setup
+ssh_file=$root/etc/ssh/sshd_config.d/12-hermes-kit-setup.conf
+timer_file=$root/etc/systemd/system/hermes-kit-setup-expiry.timer
+service_file=$root/etc/systemd/system/hermes-kit-setup-expiry.service
+account=hermes-setup
+install -d -m 0700 "$state"
+exec 9> "$state/window.lock"
+flock -x 9
+
+usage() { echo 'Usage: kit-setup-window {open --public-key FILE|close|expire|status}' >&2; exit 2; }
+event() {
+  install -d -m 0751 "$(dirname "$events")"
+  printf '%s setup-window-%s\n' "$(date -u +%FT%TZ)" "$1" >> "$events"
+  chmod 0600 "$events"
+}
+traces_present() {
+  id -u "$account" >/dev/null 2>&1 || [[ -e $key_file || -e $sudo_file || -e $ssh_file ]]
+}
+close_window() {
+  local reason=$1
+  if [[ ! -e $state/started-at && ! -e $state/account-created ]]; then
+    ! traces_present || { echo 'Unowned setup access traces exist; refusing removal.' >&2; return 1; }
+    return 0
+  fi
+  install -d -m 0700 "$state"
+  if id -u "$account" >/dev/null 2>&1; then
+    [[ -f $state/account-created ]] || { echo 'Refusing to delete an account the kit did not create.' >&2; return 1; }
+  fi
+  # Block new logins before terminating any live session.
+  rm -f -- "$key_file" "$sudo_file"
+  sshd_file_apply "$ssh_file"
+  systemctl reload ssh.service || systemctl restart ssh.socket
+  if id -u "$account" >/dev/null 2>&1; then
+    loginctl terminate-user "$account" || true
+    for attempt in {1..20}; do
+      userdel "$account" >/dev/null 2>&1 && break
+      [[ $attempt != 20 ]] || break
+      sleep 0.25
+    done
+  fi
+  ! traces_present || { echo 'Setup access traces remain.' >&2; return 1; }
+  if [[ ! -f $state/closed-at ]]; then
+    date -u +%s > "$state/closed-at"
+    chmod 0600 "$state/closed-at"
+    event "closed reason=$reason"
+  fi
+  systemctl disable --now hermes-kit-setup-expiry.timer 2>/dev/null || true
+}
+open_window() {
+  local supplied=$1 started expires expiry_iso fingerprint staged key key_type key_blob
+  [[ -r $supplied ]] || usage
+  install -d -m 0700 "$state"
+  [[ ! -e $state/closed-at ]] || { echo 'Setup window was already closed; refusing to reopen.' >&2; return 0; }
+  if [[ ! -e $state/started-at ]]; then date -u +%s > "$state/started-at"; chmod 0600 "$state/started-at"; fi
+  started=$(<"$state/started-at")
+  [[ $started =~ ^[0-9]+$ ]] || { echo 'Invalid setup start time.' >&2; return 1; }
+  expires=$((started + 48 * 3600))
+  if [[ -e $state/expires-at ]]; then
+    [[ $(<"$state/expires-at") == "$expires" ]] || { echo 'Setup expiry differs from original install.' >&2; return 1; }
+  else
+    printf '%s\n' "$expires" > "$state/expires-at"
+    chmod 0600 "$state/expires-at"
+  fi
+  if (( $(date -u +%s) >= expires )); then close_window expired; return; fi
+  if [[ ! -f $state/account-created && ( -e $key_file || -e $sudo_file || -e $ssh_file ) ]]; then
+    echo 'Unowned setup access files exist; refusing replacement.' >&2
+    return 1
+  fi
+  key=$(<"$supplied")
+  [[ $key != *$'\n'* && $key != *$'\r'* ]] || { echo 'Expected one Ed25519 public key.' >&2; return 1; }
+  read -r key_type key_blob _ <<<"$key"
+  [[ $key_type == ssh-ed25519 || $key_type == sk-ssh-ed25519@openssh.com ]] || { echo 'Expected one Ed25519 public key.' >&2; return 1; }
+  [[ $key_blob =~ ^[A-Za-z0-9+/]+={0,3}$ ]] || { echo 'Invalid SSH public key.' >&2; return 1; }
+  fingerprint=$(ssh-keygen -lf "$supplied" | awk '{print $2}')
+  [[ $fingerprint == SHA256:* ]] || { echo 'Invalid SSH public key.' >&2; return 1; }
+  expiry_iso=$(date -u -d "@$expires" +%Y%m%d%H%M%SZ)
+  install -d -m 0755 "$(dirname "$key_file")" "$(dirname "$sudo_file")" "$(dirname "$ssh_file")" "$(dirname "$timer_file")"
+  if ! id -u "$account" >/dev/null 2>&1; then
+    useradd --create-home --shell /usr/bin/tlog-rec-session "$account"
+    : > "$state/account-created"
+    chmod 0600 "$state/account-created"
+  else
+    [[ -f $state/account-created ]] || { echo 'Refusing to reuse an account the kit did not create.' >&2; return 1; }
+  fi
+  printf 'expiry-time="%s",restrict,pty %s %s\n' "$expiry_iso" "$key_type" "$key_blob" | install -m 0644 /dev/stdin "$key_file"
+  printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$account" | install -m 0440 /dev/stdin "$sudo_file"
+  visudo -cf "$sudo_file"
+  staged=$(mktemp)
+  cat > "$staged" <<EOF
+Match User $account
+    AuthenticationMethods publickey
+    AuthorizedKeysFile $key_file
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    PermitTTY yes
+EOF
+  if ! sshd_file_apply "$ssh_file" "$staged"; then rm -f "$staged"; return 1; fi
+  rm -f "$staged"
+  systemctl reload ssh.service || systemctl restart ssh.socket
+  cat > "$service_file" <<'EOF'
+[Unit]
+Description=Remove expired Hermes Kit setup access
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kit-setup-window expire
+EOF
+  cat > "$timer_file" <<EOF
+[Unit]
+Description=Expire Hermes Kit setup access after 48 hours
+
+[Timer]
+OnBootSec=1s
+OnUnitActiveSec=1min
+OnCalendar=$(date -u -d "@$expires" '+%Y-%m-%d %H:%M:%S UTC')
+AccuracySec=1s
+Persistent=true
+Unit=hermes-kit-setup-expiry.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 "$service_file" "$timer_file"
+  systemctl daemon-reload
+  systemctl enable --now hermes-kit-setup-expiry.timer
+  if [[ ! -e $state/opened-at ]]; then
+    date -u +%s > "$state/opened-at"
+    chmod 0600 "$state/opened-at"
+    event "opened until=$(date -u -d "@$expires" +%FT%TZ) fingerprint=$fingerprint"
+  fi
+  echo "Setup SSH: ssh $account@<server-ip> (expires $(date -u -d "@$expires" +%FT%TZ))"
+}
+
+case ${1:-} in
+  open) [[ ${2:-} == --public-key && -n ${3:-} && $# -eq 3 ]] || usage; open_window "$3" ;;
+  close) [[ $# -eq 1 ]] || usage; close_window early ;;
+  expire)
+    [[ $# -eq 1 ]] || usage
+    if [[ -f $state/expires-at && $(<"$state/expires-at") =~ ^[0-9]+$ ]] && (( $(date -u +%s) >= $(<"$state/expires-at") )); then close_window expired; fi
+    ;;
+  status)
+    [[ $# -eq 1 ]] || usage
+    if [[ -f $state/expires-at && ! -f $state/closed-at ]]; then date -u -d "@$(<"$state/expires-at")" +%FT%TZ; else echo none; fi
+    ;;
+  *) usage ;;
+esac
