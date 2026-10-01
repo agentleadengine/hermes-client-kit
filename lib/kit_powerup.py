@@ -42,7 +42,12 @@ def enabled_plugins():
     if os.environ.get("KIT_POWERUP_TEST_MODE") == "1":
         path = ETC / "test-config.json"
         return json.loads(path.read_text()).get("plugins.enabled", []) if path.exists() else []
-    result = subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "config", "get", "plugins.enabled", "--json"], capture_output=True, text=True, check=True)
+    result = subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "config", "get", "plugins.enabled", "--json"], capture_output=True, text=True)
+    if result.returncode != 0:
+        # A fresh profile has no plugins.enabled key yet; Hermes reports that as an error.
+        if "not set" in (result.stdout + result.stderr).lower():
+            return []
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     value = json.loads(result.stdout)
     return value if isinstance(value, list) else []
 
