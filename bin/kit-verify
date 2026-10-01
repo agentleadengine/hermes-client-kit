@@ -79,8 +79,18 @@ effective_json_is() {
   [[ -n $actual && $actual == "$expected" ]]
 }
 
+# The Hermes installer has used both venv/ and .venv/ for its environment.
+hermes_venv_python() {
+  local candidate
+  for candidate in "$hermes_root/hermes-agent/venv/bin/python" "$hermes_root/hermes-agent/.venv/bin/python"; do
+    [[ -x $candidate ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  printf '%s\n' "$hermes_root/hermes-agent/venv/bin/python"
+}
+
 dotenv_value() {
-  local key=$1 hermes_python="$hermes_root/hermes-agent/.venv/bin/python"
+  local key=$1 hermes_python
+  hermes_python=$(hermes_venv_python)
   [[ -x $hermes_python ]] || return 1
   runuser -u hermes -- "$hermes_python" - "$hermes_home/.env" "$key" <<'PY'
 from dotenv import dotenv_values
@@ -92,7 +102,8 @@ PY
 }
 
 dotenv_assignments() {
-  local hermes_python="$hermes_root/hermes-agent/.venv/bin/python"
+  local hermes_python
+  hermes_python=$(hermes_venv_python)
   if [[ -x $hermes_python ]]; then
     runuser -u hermes -- "$hermes_python" - "$hermes_home/.env" <<'PY'
 from dotenv import dotenv_values
@@ -334,7 +345,7 @@ case $MESSAGING_PLATFORM in
     messaging_secret=
     ;;
 esac
-if [[ $MESSAGING_PLATFORM != none ]] && ! effective_is "platform_toolsets.$MESSAGING_PLATFORM" "$approved_platform_tools"; then fail "$MESSAGING_PLATFORM effective tool policy matches baseline"; fi
+if [[ $MESSAGING_PLATFORM != none ]] && ! effective_json_is "platform_toolsets.$MESSAGING_PLATFORM" "$approved_platform_tools"; then fail "$MESSAGING_PLATFORM effective tool policy matches baseline"; fi
 if [[ -n ${messaging_allowlist:-} ]]; then
   if validate_explicit_allowlist "$(dotenv_value "$messaging_allowlist")"; then pass "$MESSAGING_PLATFORM allowlist set"; else fail "$MESSAGING_PLATFORM allowlist set"; fi
   if env_has_value "$messaging_secret"; then
