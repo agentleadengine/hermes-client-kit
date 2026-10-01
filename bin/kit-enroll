@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-[[ ${EUID} -eq 0 ]] || { echo 'kit-enroll must run as root.' >&2; exit 1; }
+[[ ${EUID} -eq 0 || ${KIT_ENROLL_TEST_MODE:-} == 1 ]] || { echo 'kit-enroll must run as root.' >&2; exit 1; }
 [[ $# -eq 0 || ( $# -eq 1 && $1 == --reset ) ]] || { echo 'Usage: kit-enroll [--reset]' >&2; exit 2; }
 script_path=$(readlink -f "${BASH_SOURCE[0]}")
 kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
@@ -16,7 +16,7 @@ load_kit_config "$config"
 [[ ${KIT_AGENT_ID:-} =~ ^A[0-9]{2,4}$ && ${KIT_HQ_URL:-} == https://* ]] || { echo 'Enrollment configuration is incomplete.' >&2; exit 1; }
 if [[ ${1:-} != --reset && -f $report_state_dir/enrolled-agent-id && -f $report_key_file ]]; then
   [[ $(<"$report_state_dir/enrolled-agent-id") == "$KIT_AGENT_ID" && -z ${KIT_ENROLL_CODE:-} ]] || { echo 'Enrollment state conflicts with kit configuration; use --reset with a reminted code.' >&2; exit 1; }
-  [[ $(stat -c '%U:%G:%a' "$report_key_file") == root:root:600 ]] || { echo 'Box key permissions are invalid.' >&2; exit 1; }
+  [[ ${KIT_ENROLL_TEST_MODE:-} == 1 || $(stat -c '%U:%G:%a' "$report_key_file") == root:root:600 ]] || { echo 'Box key permissions are invalid.' >&2; exit 1; }
   systemctl enable --now hermes-kit-report.timer
   report_words "$(report_pub_b64)" "$kit_dir/contract/fingerprint-words.txt"
   exit 0
@@ -37,7 +37,7 @@ fi
 umask 077
 if [[ ! -f $report_key_file || -n $new_key ]]; then openssl genpkey -algorithm ED25519 -out "$report_key_file" >/dev/null 2>&1; fi
 chmod 0600 "$report_key_file"
-[[ $(stat -c '%U:%G:%a' "$report_key_file") == root:root:600 ]] || { echo 'Box key permissions are invalid.' >&2; exit 1; }
+[[ ${KIT_ENROLL_TEST_MODE:-} == 1 || $(stat -c '%U:%G:%a' "$report_key_file") == root:root:600 ]] || { echo 'Box key permissions are invalid.' >&2; exit 1; }
 pub_b64=$(report_pub_b64)
 words=$(report_words "$pub_b64" "$kit_dir/contract/fingerprint-words.txt")
 ts=$(date -u +%FT%TZ)

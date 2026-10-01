@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 STATE = Path("/var/lib/agent-care/activation")
 SUPPORT = Path("/var/lib/agent-care/support")
 HOME = Path("/var/lib/agent-care/home")
+REPORT_STATE = Path("/var/lib/hermes-kit/report")
 SAFE_DURATION = {"1", "2", "8", "24"}
 
 def read(path, default=""):
@@ -40,6 +41,12 @@ def config_value(name):
             return line.split("=", 1)[1].strip().strip("\"'")
     return ""
 
+def enrollment_notice():
+    words = read(STATE / "fingerprint-words")
+    if (REPORT_STATE / "enrolled-agent-id").is_file() and words:
+        return "<p>Read these 4 words to your setup guide: " + html.escape(words) + "</p>"
+    return "<p>Connecting to Agent Care... refresh in a minute</p>"
+
 def page(title, body):
     return f"<!doctype html><html><head><meta name=\"referrer\" content=\"no-referrer\"><meta name=\"viewport\" content=\"width=device-width\"><title>{html.escape(title)}</title><style>body{{font:16px system-ui;max-width:62rem;margin:2rem auto;padding:0 1rem;color:#17202b}}section{{border:1px solid #ccd3db;border-radius:.5rem;padding:1rem;margin:1rem 0}}form{{margin:.5rem 0}}input,textarea,select,button{{font:inherit;padding:.45rem}}textarea{{width:min(100%,40rem)}}button{{cursor:pointer}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f6f8;padding:1rem}}.row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}</style></head><body><main><h1>{html.escape(title)}</h1>{body}</main></body></html>".encode()
 
@@ -55,7 +62,8 @@ def home_page(token):
     access = health.get("access", {})
     powers = set(health.get("power_ups", ["base"]))
     tools = health.get("tools", [])
-    section = '<p>This page closes after 2 hours. Only someone with this link can use it. Keep the link private.</p>'
+    section = enrollment_notice()
+    section += '<p>This page closes after 2 hours. Only someone with this link can use it. Keep the link private.</p>'
     section += '<section><h2>What Sam can see</h2><p>This is the exact last health payload sent from your server. It does not include chats, files or tool data.</p><pre>' + html.escape(health_raw) + '</pre></section>'
     section += f'<section><h2>Your plan and team access</h2><p>Plan: <strong>{html.escape(tier.title())}</strong>. Manager key present: {str(bool(access.get("manager_key_present"))).lower()}. Full access active: {str(bool(access.get("full_access_active"))).lower()}.</p>'
     if tier == "managed":
@@ -111,7 +119,7 @@ class Handler(BaseHTTPRequestHandler):
         token = self.token(STATE, "/activate")
         if token:
             log = html.escape(read(STATE / "codex-device.log")[-4000:])
-            self.send_html(200, "Activate your private Hermes agent", f"<p>Sign in with your own ChatGPT account. This page never displays agent data.</p><form method=post action='/activate/{token}/codex'><button>Show ChatGPT device code</button></form><pre>{log}</pre><form method=post action='/activate/{token}/complete'><button>Finish activation and close this page</button></form>")
+            self.send_html(200, "Activate your private Hermes agent", enrollment_notice() + f"<p>Sign in with your own ChatGPT account. This page never displays agent data.</p><form method=post action='/activate/{token}/codex'><button>Show ChatGPT device code</button></form><pre>{log}</pre><form method=post action='/activate/{token}/complete'><button>Finish activation and close this page</button></form>")
             return
         token = self.token(SUPPORT, "/support")
         if token:

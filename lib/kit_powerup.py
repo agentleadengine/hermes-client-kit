@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import shutil
@@ -11,6 +12,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from hermes_runtime import HERMES_BIN
+from logins_policy import hermes_blocklist
 
 ETC = Path(os.environ.get("KIT_POWERUP_ETC", "/etc/hermes-kit"))
 HOME = Path(os.environ.get("KIT_POWERUP_HOME", "/home/hermes/.hermes/profiles/client"))
@@ -19,7 +21,7 @@ LEDGER = ETC / "consents.json"
 POWERUPS = {"base", "builder", "website", "schedules", "logins"}
 BASE_DISABLED = ["terminal", "code_execution", "browser", "computer_use", "delegation", "kanban", "cronjob", "image_gen", "tts", "homeassistant", "messaging"]
 BASE_TOOLS = ["clarify", "file", "memory", "search", "skills", "todo", "vision", "web"]
-BLOCKED = ["paypal.com", "*.paypal.com", "stripe.com", "*.stripe.com", "chase.com", "*.chase.com", "bankofamerica.com", "*.bankofamerica.com", "wellsfargo.com", "*.wellsfargo.com", "gmail.com", "*.gmail.com", "outlook.com", "*.outlook.com", "mail.google.com", "adp.com", "*.adp.com", "gusto.com", "*.gusto.com"]
+BLOCKED = hermes_blocklist()
 
 
 def run(args: list[str]):
@@ -137,6 +139,7 @@ def off(name: str):
         subprocess.run(["systemctl", "stop", "hermes-kit-website-preview.service"], check=False)
     if name == "logins" and os.environ.get("KIT_POWERUP_TEST_MODE") != "1":
         subprocess.run(["systemctl", "stop", "hermes-kit-logins-browser.service"], check=False)
+        subprocess.run(["systemctl", "disable", "--now", "hermes-kit-logins-cdp.service"], check=False)
         subprocess.run(["systemctl", "stop", "hermes-kit-logins-proxy.service"], check=False)
         Path("/var/lib/hermes-kit/logins-active-domain").unlink(missing_ok=True)
 
@@ -174,6 +177,16 @@ def validate_cron_jobs():
             raise ValueError("Cron job has a non-read/draft toolset")
 
 
+def cdp_rules(hermes_uid: int) -> str:
+    return f"""table inet hermes_kit_logins {{
+  chain output {{
+    type filter hook output priority -10; policy accept;
+    ip daddr 127.0.0.1 tcp dport 9222 meta skuid != {{ 0, {hermes_uid} }} drop
+  }}
+}}
+"""
+
+
 def install_logins():
     source = KIT / "plugins" / "kit-logins"
     target = HOME / "plugins" / "kit-logins"
@@ -195,6 +208,26 @@ def install_logins():
             browser = shutil.which("chromium") or shutil.which("chromium-browser")
         if not browser:
             raise ValueError("Local Chromium is required for Logins")
+        run(["apt-get", "-y", "--no-install-recommends", "install", "nftables"])
+        hermes_uid = pwd.getpwnam("hermes").pw_uid
+        rules = ETC / "logins-cdp.nft"
+        rules.write_text(cdp_rules(hermes_uid))
+        rules.chmod(0o644)
+        firewall = Path("/etc/systemd/system/hermes-kit-logins-cdp.service")
+        firewall.write_text("""[Unit]
+Description=Restrict Hermes Logins browser debug port to Hermes
+After=nftables.service
+Before=hermes-kit-logins-browser.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet hermes_kit_logins
+ExecStart=/usr/sbin/nft -f /etc/hermes-kit/logins-cdp.nft
+ExecStop=/usr/sbin/nft delete table inet hermes_kit_logins
+[Install]
+WantedBy=multi-user.target
+""")
+        firewall.chmod(0o644)
         proxy = Path("/etc/systemd/system/hermes-kit-logins-proxy.service")
         proxy.write_text(f"""[Unit]
 Description=HTTPS domain guard for Hermes Logins
@@ -213,8 +246,8 @@ WantedBy=multi-user.target
         unit = Path("/etc/systemd/system/hermes-kit-logins-browser.service")
         unit.write_text(f"""[Unit]
 Description=Site-isolated local Chromium for Hermes Logins
-After=network-online.target hermes-kit-logins-proxy.service
-Requires=hermes-kit-logins-proxy.service
+After=network-online.target hermes-kit-logins-proxy.service hermes-kit-logins-cdp.service
+Requires=hermes-kit-logins-proxy.service hermes-kit-logins-cdp.service
 [Service]
 User=logins
 Group=logins
@@ -230,6 +263,8 @@ WantedBy=multi-user.target
 """)
         unit.chmod(0o644)
         run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", "hermes-kit-logins-cdp.service"])
+        run(["systemctl", "restart", "hermes-kit-logins-cdp.service"])
 
 
 def main():

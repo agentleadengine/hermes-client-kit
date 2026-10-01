@@ -7,15 +7,15 @@ import re
 import select
 import socket
 import socketserver
+from logins_policy import denied
 
 ACTIVE = Path(os.environ.get("KIT_LOGINS_ACTIVE", "/var/lib/hermes-kit/logins-active-domain"))
 HOST = re.compile(r"^[a-z0-9][a-z0-9.-]{1,251}[a-z0-9]$")
-DENY = ("bank", "credit", "payment", "payroll", "mail", "inbox", "stripe", "paypal", "chase", "wellsfargo", "gusto", "adp")
 
 
 def permitted(host: str, active: str) -> bool:
     host = host.lower().rstrip(".")
-    return bool(HOST.fullmatch(host) and (host == active or host.endswith("." + active)) and not any(term in host for term in DENY))
+    return bool(HOST.fullmatch(host) and (host == active or host.endswith("." + active)) and not denied(host))
 
 
 class Proxy(socketserver.StreamRequestHandler):

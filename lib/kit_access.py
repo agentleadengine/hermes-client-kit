@@ -64,6 +64,12 @@ def event(kind: str, **fields):
     report.chmod(0o644)
 
 
+def record_full_downgrade(target_tier: str):
+    if target_tier not in {"care", "managed"}:
+        raise ValueError("Expected lower access tier")
+    event("full-removed", reason="downgrade", tier=target_tier)
+
+
 def public_key(path: str):
     lines = Path(path).read_text().splitlines()
     if len(lines) != 1 or not KEY.fullmatch(lines[0]):
@@ -105,7 +111,9 @@ def ssh_reload():
     if os.environ.get("KIT_ACCESS_TEST_MODE") == "1":
         return
     run(["sshd", "-t"])
-    run(["systemctl", "reload", "ssh"])
+    service = run(["systemctl", "reload", "ssh.service"], check=False)
+    if service.returncode:
+        run(["systemctl", "restart", "ssh.socket"])
 
 
 def setup_manager():
@@ -164,7 +172,7 @@ def revoke_manager(fingerprint: str | None):
         kept = []
     write_keys(MANAGER, kept)
     mirror_ssh(MANAGER, MANAGER_SSH)
-    if os.environ.get("KIT_ACCESS_TEST_MODE") != "1":
+    if not kept and os.environ.get("KIT_ACCESS_TEST_MODE") != "1":
         run(["loginctl", "terminate-user", "kit-manager"], check=False)
     ssh_reload()
     event("manager-revoked", fingerprint=fingerprint or "all")
@@ -192,12 +200,12 @@ def remove_team_key(fingerprint: str):
     for path, mirror, kept in changes:
         write_keys(path, kept)
         mirror_ssh(path, mirror)
+    # Record the specific revocation before any session can be terminated.
+    event("team-key-removed", fingerprint=fingerprint, locations=",".join(path.parent.name for path, _, _ in changes) or "none")
     if changes:
         ssh_reload()
-        if os.environ.get("KIT_ACCESS_TEST_MODE") != "1":
-            for path, _, _ in changes:
-                run(["loginctl", "terminate-user", "kit-manager" if path == MANAGER else "hermes-ops"], check=False)
-    event("team-key-removed", fingerprint=fingerprint, locations=",".join(path.parent.name for path, _, _ in changes) or "none")
+        # Removing one key must not kill another key's active session. sshd
+        # rejects new logins with the removed key immediately after the mirror.
 
 
 def full_access(action: str, path_or_fingerprint: str, waiver: str | None):
@@ -306,19 +314,40 @@ def dispatch(command: str):
     try:
         args = menu(command)
         event("manager-command", command=args[0], outcome="started")
+        if args[0] == "verify":
+            result = run(["/usr/local/bin/kit-verify", "--json"], check=False)
+            event("manager-command", command="verify", outcome="accepted", exit_status=result.returncode)
+            return result.returncode
         _execute(args)
     except (ValueError, OSError, subprocess.CalledProcessError):
-        event("manager-command", command=hashlib.sha256(command.encode()).hexdigest()[:16], outcome="refused")
+        event("manager-command", command=hashlib.sha256(refused_command(command).encode()).hexdigest()[:16], outcome="refused")
         raise
     event("manager-command", command=args[0], outcome="accepted")
+    return 0
+
+
+def refused_command(command: str) -> str:
+    # OpenSSH may provide the subsystem name, the configured executable, or
+    # the executable with arguments as SSH_ORIGINAL_COMMAND. Audit the
+    # configured command, matching the value reported by sshd -T.
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return command
+    if not words or (words[0] not in {"internal-sftp", "sftp"} and Path(words[0]).name != "sftp-server"):
+        return command
+    configured = run(["sshd", "-T"], capture_output=True, check=False)
+    for line in configured.stdout.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) == 3 and parts[:2] == ["subsystem", "sftp"]:
+            return parts[2].strip()
+    return command
 
 
 def _execute(args: list[str]):
     op = args[0]
     if op == "status":
         print((STATE / "health.json").read_text())
-    elif op == "verify":
-        run(["/usr/local/bin/kit-verify", "--json"])
     elif op == "show-config":
         print((PROFILE / "config.yaml").read_text())
     elif op in {"config-get", "config-set"}:
@@ -387,7 +416,7 @@ def main():
                 os.execv("/usr/bin/sudo", ["sudo", "-n", "/usr/local/sbin/kit-manage-dispatch", original])
             if len(sys.argv) != 2:
                 raise ValueError("Command refused")
-            dispatch(sys.argv[1])
+            sys.exit(dispatch(sys.argv[1]))
         else:
             raise ValueError("Unknown command")
     except (ValueError, OSError, RuntimeError, subprocess.CalledProcessError) as exc:

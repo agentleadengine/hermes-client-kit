@@ -35,6 +35,14 @@ EOF
 # recreating access on every install.
 if [[ $KIT_TIER == care || $KIT_TIER == managed ]]; then
   # A downgrade removes standing Full Service keys before any service restarts.
+  if [[ -s /etc/hermes-kit/full/authorized_keys || -s /etc/ssh/kit-full.keys || -e /etc/sudoers.d/90-hermes-kit-hermes-ops ]] || compgen -G '/var/lib/hermes-kit/grants/*-cert.pub' >/dev/null; then
+    python3 - "$KIT_DIR/lib" "$KIT_TIER" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from kit_access import record_full_downgrade
+record_full_downgrade(sys.argv[2])
+PY
+  fi
   if [[ -f /etc/hermes-kit/full/authorized_keys ]]; then : > /etc/hermes-kit/full/authorized_keys; chmod 0600 /etc/hermes-kit/full/authorized_keys; fi
   rm -f /etc/ssh/kit-full.keys
   for certificate in /var/lib/hermes-kit/grants/*-cert.pub; do
@@ -161,6 +169,28 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+install -m 0644 /dev/stdin /etc/systemd/system/hermes-kit-enroll.service <<'EOF'
+[Unit]
+Description=Retry Hermes Kit enrollment with Agent Care
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kit-enroll-retry
+EOF
+install -m 0644 /dev/stdin /etc/systemd/system/hermes-kit-enroll.timer <<'EOF'
+[Unit]
+Description=Retry Hermes Kit enrollment while the code is valid
+
+[Timer]
+OnBootSec=2m
+OnUnitInactiveSec=5m
+Unit=hermes-kit-enroll.service
+
+[Install]
+WantedBy=timers.target
+EOF
 install -m 0644 /dev/stdin /etc/systemd/system/hermes-kit-report-shutdown.service <<'EOF'
 [Unit]
 Description=Send final Hermes Kit shutdown report
@@ -218,7 +248,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-for helper in kit-grant-access kit-revoke-access kit-handover kit-health kit-enroll kit-report kit-downtime kit-expire-grants kit-autoupdate kit-set-support-key kit-manage-grant kit-manage-revoke kit-full-access kit-powerup; do ln -sfn "$KIT_RUNTIME_DIR/bin/$helper" "/usr/local/bin/$helper"; done
+for helper in kit-grant-access kit-revoke-access kit-handover kit-health kit-enroll kit-enroll-retry kit-report kit-downtime kit-expire-grants kit-autoupdate kit-set-support-key kit-manage-grant kit-manage-revoke kit-full-access kit-powerup; do ln -sfn "$KIT_RUNTIME_DIR/bin/$helper" "/usr/local/bin/$helper"; done
 ln -sfn "$KIT_RUNTIME_DIR/bin/kit-manage-dispatch" /usr/local/sbin/kit-manage-dispatch
 systemctl daemon-reload
 systemctl enable --now hermes-kit-health.timer hermes-kit-autoupdate.timer hermes-kit-report-shutdown.service

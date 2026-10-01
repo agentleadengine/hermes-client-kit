@@ -6,17 +6,17 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from logins_policy import denied
 
 ETC = Path("/etc/hermes-kit")
 PROFILES = Path("/var/lib/hermes-kit/logins/profiles")
 DOMAINS = Path("/var/lib/hermes-kit/logins-domains.json")
 DOMAIN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,251}[a-z0-9]$")
-DENY = ("bank", "credit", "payment", "payroll", "mail", "inbox", "stripe", "paypal", "chase", "wellsfargo", "gusto", "adp")
 
 
 def clean_domain(value):
     value = value.lower().rstrip(".")
-    if not DOMAIN.fullmatch(value) or ".." in value or any(term in value for term in DENY):
+    if not DOMAIN.fullmatch(value) or ".." in value or denied(value):
         raise ValueError("Domain is outside the Logins policy")
     return value
 

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${EUID} -eq 0 || ${KIT_ENROLL_RETRY_TEST_MODE:-} == 1 ]] || { echo 'kit-enroll-retry must run as root.' >&2; exit 1; }
+[[ $# -eq 0 || ( $# -eq 1 && $1 == --install ) ]] || { echo 'Usage: kit-enroll-retry [--install]' >&2; exit 2; }
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+kit_dir=$(cd -- "$(dirname -- "$script_path")/.." && pwd)
+# shellcheck source=../lib/common.sh
+source "$kit_dir/lib/common.sh"
+# shellcheck source=../lib/report-common.sh
+source "$kit_dir/lib/report-common.sh"
+report_key_file=${KIT_REPORT_KEY_FILE:-/etc/hermes-kit/report/box_ed25519.pem}
+report_state_dir=${KIT_REPORT_STATE_DIR:-/var/lib/hermes-kit/report}
+config=${KIT_CONFIG:-/etc/hermes-kit/kit.conf}
+state=${KIT_ENROLL_RETRY_STATE_DIR:-/var/lib/hermes-kit/enroll-retry}
+words_file=${KIT_FINGERPRINT_WORDS_FILE:-/var/lib/agent-care/activation/fingerprint-words}
+enroll_command=${KIT_ENROLL_RETRY_COMMAND:-/usr/local/bin/kit-enroll}
+now=${KIT_ENROLL_RETRY_NOW:-$(date -u +%s)}
+[[ $now =~ ^[0-9]+$ ]] || { echo 'Invalid enrollment retry clock.' >&2; exit 1; }
+install -d -m 0700 "$state"
+exec 9>"$state/lock"
+flock 9
+load_kit_config "$config"
+
+stop_retry() {
+  systemctl disable --now hermes-kit-enroll.timer 2>/dev/null || true
+}
+
+publish_enrolled() {
+  local words temp
+  [[ -f $report_state_dir/enrolled-agent-id && -f $report_key_file ]] || return 1
+  [[ $(<"$report_state_dir/enrolled-agent-id") == "${KIT_AGENT_ID:-}" ]] || return 1
+  words=$(report_words "$(report_pub_b64)" "$kit_dir/contract/fingerprint-words.txt") || return 1
+  install -d -m 0700 "$(dirname "$words_file")"
+  temp=$(mktemp "$(dirname "$words_file")/.fingerprint-words.XXXXXX")
+  printf '%s\n' "$words" > "$temp"
+  chmod 0644 "$temp"
+  mv -f -- "$temp" "$words_file"
+  systemctl enable --now hermes-kit-report.timer
+}
+
+if [[ -f $report_state_dir/enrolled-agent-id ]]; then
+  if publish_enrolled; then
+    log 'Enrollment already complete; fingerprint words and signed health reporting are ready.'
+    stop_retry
+  else
+    log 'Enrollment marker exists but identity, key, or report timer needs repair.'
+    systemctl enable --now hermes-kit-enroll.timer
+  fi
+  exit 0
+fi
+
+if [[ -z ${KIT_AGENT_ID:-} || -z ${KIT_ENROLL_CODE:-} || -z ${KIT_HQ_URL:-} ]]; then
+  log 'Enrollment settings are absent; no enrollment attempt made.'
+  stop_retry
+  exit 0
+fi
+
+code_hash=$(printf '%s' "$KIT_ENROLL_CODE" | sha256sum | cut -d' ' -f1)
+if [[ ! -f $state/code-sha256 || $(<"$state/code-sha256") != "$code_hash" ]]; then
+  printf '%s\n' "$code_hash" > "$state/code-sha256"
+  printf '%s\n' "$now" > "$state/started-at"
+  chmod 0600 "$state/code-sha256" "$state/started-at"
+fi
+started=$(<"$state/started-at")
+[[ $started =~ ^[0-9]+$ ]] || { echo 'Invalid enrollment retry state.' >&2; exit 1; }
+if (( now >= started + 48 * 60 * 60 )); then
+  log 'Enrollment retry window ended after 48 hours; a new code is required.'
+  stop_retry
+  exit 0
+fi
+
+log 'Attempting enrollment with Agent Care.'
+if "$enroll_command" >/dev/null && publish_enrolled; then
+  log 'Enrollment succeeded; fingerprint words published and signed health timer enabled.'
+  stop_retry
+else
+  log 'Enrollment failed; retry timer armed for five minutes.'
+  systemctl enable --now hermes-kit-enroll.timer
+fi

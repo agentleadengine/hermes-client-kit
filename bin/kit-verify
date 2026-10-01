@@ -23,6 +23,7 @@ check_id() {
     *allowlist*|*ALLOWLIST*) printf '%s' CHECK_ALLOWLIST ;;
     *credential*|*CREDENTIAL*) printf '%s' CHECK_CREDENTIAL_INVENTORY ;;
     *health*|*HEALTH*) printf '%s' CHECK_HEALTH ;;
+    *enroll*|*ENROLL*) printf '%s' CHECK_ENROLLMENT ;;
     *support*|*SUPPORT*) printf '%s' CHECK_SUPPORT ;;
     *CARE*) printf '%s' CHECK_CARE_ACCESS ;;
     *LUDICROUS*) printf '%s' CHECK_LUDICROUS_ACCESS ;;
@@ -161,7 +162,7 @@ dashboard_listener_addresses() {
   local process_path pid command
   for process_path in /proc/[0-9]*; do
     pid=${process_path##*/}
-    command=$(tr '\0' ' ' <"$process_path/cmdline" 2>/dev/null || true)
+    command=$( { tr '\0' ' ' <"$process_path/cmdline"; } 2>/dev/null || true)
     [[ $command == *' dashboard '* ]] || continue
     ss -lntpH 2>/dev/null | awk -v wanted_pid="$pid" '$0 ~ ("pid=" wanted_pid ",") { print $4 }'
   done | sort -u
@@ -203,7 +204,11 @@ non_loop_ports=$(ss -lntH | awk '
     print address
   }
 ' | sort -u || true)
-if [[ -z $non_loop_ports || $non_loop_ports == 22 ]]; then pass 'only SSH listens off loopback'; else fail "unexpected non-loopback listener(s): $non_loop_ports"; fi
+# The client's activation / Assistant Home page (Caddy on 80/443) is open on purpose for a limited time.
+allowed_ports='22'
+if systemctl is-active --quiet hermes-kit-activation.service && systemctl is-active --quiet caddy; then allowed_ports='22 80 443'; fi
+unexpected_ports=$(for port in $non_loop_ports; do [[ " $allowed_ports " == *" $port "* ]] || printf '%s ' "$port"; done)
+if [[ -z $unexpected_ports ]]; then pass "only expected ports listen off loopback ($allowed_ports)"; else fail "unexpected non-loopback listener(s): ${unexpected_ports% }"; fi
 
 hermes_groups=$(id -nG hermes)
 if [[ $hermes_groups =~ (^|[[:space:]])(sudo|docker)($|[[:space:]]) ]]; then fail 'hermes is outside sudo and docker groups'; else pass 'hermes is outside sudo and docker groups'; fi
@@ -256,9 +261,23 @@ PY
 elif [[ -f $hermes_home/cron/jobs.json ]] && jq -e '(if type == "array" then . else .jobs // [] end) | any(.[]; .enabled != false)' "$hermes_home/cron/jobs.json" >/dev/null 2>&1; then
   fail 'SCHEDULES active without consent'
 fi
+tool_parent_ok=false
+if [[ -d /srv/tools/data && $(stat -c '%U:%G:%a' /srv/tools/data 2>/dev/null) == root:kit-tool-data:710 ]]; then
+  tool_parent_ok=true
+  tool_canary=$(mktemp /srv/tools/data/.kit-parent-canary.XXXXXX)
+  printf 'tool-parent-read-refused\n' > "$tool_canary"
+  chmod 0644 "$tool_canary"
+  for non_tool_user in kit-manager builder hermes hermes-support; do
+    if id -u "$non_tool_user" >/dev/null 2>&1 && runuser -u "$non_tool_user" -- test -r "$tool_canary"; then
+      tool_parent_ok=false
+    fi
+  done
+  rm -f "$tool_canary"
+fi
+if [[ $tool_parent_ok == true ]]; then pass 'TOOL data parent blocks non-tool users'; else fail 'TOOL data parent access boundary'; fi
 if consent_exists builder; then
   nft_rules=$(nft list table inet hermes_kit_tools 2>/dev/null || true)
-  if id -u builder >/dev/null 2>&1 && [[ $(stat -c '%a' /srv/tools/data 2>/dev/null) == 711 ]] &&
+  if id -u builder >/dev/null 2>&1 && [[ $tool_parent_ok == true ]] &&
      grep -Fq "skuid $(id -u builder)" <<<"$nft_rules" && grep -Fq 'builder_ipv4' <<<"$nft_rules" &&
      runuser -u builder -- test ! -r /home/hermes/vault && runuser -u builder -- test ! -r "$hermes_home/memories" &&
      runuser -u builder -- test ! -r "$hermes_home/.env" && runuser -u builder -- test ! -r /srv/tools/data;
@@ -269,6 +288,7 @@ if consent_exists builder; then
     [[ -d /srv/tools/data/$tool ]] || { tools_ok=false; continue; }
     tool_canary=$(mktemp "/srv/tools/data/$tool/.kit-tool-canary.XXXXXX")
     printf 'tool-cross-read-refused\n' > "$tool_canary"; chmod 0644 "$tool_canary"
+    if ! runuser -u "tool-$tool" -- test -r "$tool_canary"; then tools_ok=false; fi
     for other_tool_dir in /srv/tools/data/*; do
       [[ -d $other_tool_dir && ${other_tool_dir##*/} != "$tool" ]] || continue
       if runuser -u "tool-${other_tool_dir##*/}" -- test -r "$tool_canary"; then tools_ok=false; fi
@@ -449,7 +469,8 @@ if [[ ${KIT_CHANNEL:-stable} == canary ]]; then
 elif [[ ${KIT_CHANNEL:-stable} == stable && ${KIT_RELEASE_MANIFEST_URL:-} == https://* && -n ${KIT_RELEASE_SIGNER_ID:-} && -n ${KIT_RELEASE_ALLOWED_SIGNER:-} ]]; then
   pass 'stable release pointer configuration present'
 elif [[ -f /var/lib/hermes-kit/report/enrolled-agent-id ]]; then
-  fail 'STABLE_POINTER_CONFIG'
+  # kit-autoupdate refuses to update without these settings, so nothing unsigned can install.
+  warn 'automatic updates paused until signed release settings are configured (STABLE_POINTER_CONFIG)'
 else
   warn 'stable release pointer is not configured before enrollment'
 fi
@@ -462,7 +483,7 @@ if [[ -f /var/lib/hermes-kit/report/enrolled-agent-id ]]; then
   if [[ ${KIT_AGENT_ID:-} =~ ^A[0-9]{2,4}$ && ${KIT_HQ_URL:-} == https://* && $(< /var/lib/hermes-kit/report/enrolled-agent-id) == "$KIT_AGENT_ID" ]]; then pass 'enrolled box identity matches kit configuration'; else fail 'ENROLLED_BOX_IDENTITY'; fi
   if systemctl is-active --quiet hermes-kit-report.timer; then pass 'signed report timer active after enrollment'; else fail 'REPORT_TIMER_INACTIVE'; fi
 else
-  warn 'box is not enrolled for signed reports'
+  warn 'enrollment pending; signed reports start after HQ accepts this box'
 fi
 support_disabled='["file","memory","terminal","code_execution","browser","computer_use","delegation","kanban","cronjob","image_gen","tts","homeassistant","messaging","web","search","vision"]'
 support_tools='["clarify","skills"]'
@@ -509,6 +530,8 @@ if [[ $tier == care || $tier == managed ]]; then
     if grep -Fqx 'forcecommand /usr/local/sbin/kit-manage-dispatch' <<<"$manager_policy" && grep -Fqx 'permittty no' <<<"$manager_policy" && grep -Fqx 'allowtcpforwarding no' <<<"$manager_policy" && grep -Fqx 'allowagentforwarding no' <<<"$manager_policy"; then pass 'MANAGED ForceCommand and SSH restrictions'; else fail 'MANAGED_SSH_POLICY'; fi
     manager_probe=true
     private_paths=("$hermes_home/memories" "$hermes_home/sessions" "$hermes_home/state.db" /home/hermes/vault "$hermes_home/.env" "$hermes_home/auth.json" "$hermes_root/auth.json")
+    [[ $tool_parent_ok == true ]] || manager_probe=false
+    private_paths+=(/srv/tools/data)
     for tool_dir in /srv/tools/data/*; do [[ -d $tool_dir ]] && private_paths+=("$tool_dir"); done
     for private in "${private_paths[@]}"; do
       if [[ -d $private ]]; then

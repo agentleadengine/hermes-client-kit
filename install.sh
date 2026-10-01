@@ -119,6 +119,14 @@ done
 
 write_version "$KIT_DIR"
 ln -sfn "$KIT_RUNTIME_DIR" /opt/hermes-kit/current
+# Enrollment needs the installed helpers and units from the completed lib steps.
+# A temporary HQ failure is retried independently of the installation report.
+if [[ -n ${KIT_AGENT_ID:-} && -n ${KIT_ENROLL_CODE:-} && -n ${KIT_HQ_URL:-} ]] || [[ -f /var/lib/hermes-kit/report/enrolled-agent-id ]]; then
+  if ! /usr/local/bin/kit-enroll-retry --install; then
+    log 'Enrollment setup failed; arming the retry timer without failing installation.'
+    systemctl enable --now hermes-kit-enroll.timer || true
+  fi
+fi
 if [[ -x /usr/local/bin/kit-install-report ]]; then
   /usr/local/bin/kit-install-report --installed
 fi

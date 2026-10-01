@@ -54,6 +54,12 @@ Persistent=true
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
+python3 - "$KIT_RUNTIME_DIR/lib" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from kit_tools import protect_data_parent
+protect_data_parent()
+PY
 if [[ $KIT_TIER == managed && -s /etc/hermes-kit/manager/authorized_keys ]]; then
   python3 - "$KIT_RUNTIME_DIR/lib" <<'PY'
 import sys

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -25,6 +26,7 @@ REGISTRY = ROOT / "registry.json"
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 HASH = re.compile(r"^[0-9a-f]{40}$")
 TEST = os.environ.get("KIT_TOOLS_TEST_MODE") == "1"
+DATA_GROUP = "kit-tool-data"
 
 
 def run(args, *, cwd=None, input=None, capture=False, user=None, check=True):
@@ -65,6 +67,22 @@ def entry(data, name):
     return found
 
 
+def allocate_port(data):
+    used = {int(tool["port"]) for tool in data["tools"] if tool.get("port")}
+    for port in range(8801, 9000):
+        if port in used:
+            continue
+        if TEST:
+            return port
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise ValueError("No free tool port in 8801..8999")
+
+
 def consent():
     path = ETC / "consents.json"
     return path.exists() and any(x.get("integration") == "builder" for x in json.loads(path.read_text()).get("consents", []))
@@ -91,6 +109,35 @@ def audit(action, name, **details):
     path.chmod(0o600)
 
 
+def protect_data_parent():
+    """Migrate existing tool accounts before closing the shared parent."""
+    parent = ROOT / "data"
+    ROOT.mkdir(parents=True, exist_ok=True)
+    ROOT.chmod(0o755)
+    parent.mkdir(mode=0o700, exist_ok=True)
+    # Close an older 0711 parent before inspecting its children.
+    parent.chmod(0o700)
+    changed = []
+    if not TEST:
+        run(["chown", "root:root", ROOT])
+        run(["groupadd", "--force", DATA_GROUP])
+        for child in parent.iterdir():
+            if not child.is_dir() or not NAME.fullmatch(child.name):
+                continue
+            user = "tool-" + child.name
+            if run(["id", "-u", user], capture=True, check=False).returncode:
+                continue
+            groups = run(["id", "-nG", user], capture=True).stdout.split()
+            if DATA_GROUP not in groups:
+                run(["usermod", "-a", "-G", DATA_GROUP, user])
+                changed.append(child.name)
+        run(["chown", f"root:{DATA_GROUP}", parent])
+    parent.chmod(0o710)
+    if not TEST:
+        for name in changed:
+            run(["systemctl", "try-restart", f"hermes-kit-tool-{name}.service"], check=False)
+
+
 def setup():
     root()
     if not TEST:
@@ -108,12 +155,13 @@ def setup():
         run(["loginctl", "enable-linger", "builder"])
         if run(["id", "-u", "cloudflared"], capture=True, check=False).returncode:
             run(["useradd", "--system", "--home", "/var/lib/cloudflared", "--shell", "/usr/sbin/nologin", "cloudflared"])
-    for path in (ROOT / "src", ROOT / "staging", ROOT / "releases", ROOT / "data", BACKUP):
+    for path in (ROOT / "src", ROOT / "staging", ROOT / "releases", BACKUP):
         path.mkdir(parents=True, exist_ok=True)
     BACKUP.chmod(0o700)
     if not TEST:
         run(["chown", "builder:builder", ROOT / "src", ROOT / "staging"])
-        run(["chmod", "0711", ROOT / "data"])
+    protect_data_parent()
+    if not TEST:
         install_firewall()
     if not REGISTRY.exists():
         save_registry({"tools": []})
@@ -125,6 +173,7 @@ def ensure_tool(name):
     if not TEST and run(["id", "-u", user], capture=True, check=False).returncode:
         run(["useradd", "--system", "--create-home", "--shell", "/usr/sbin/nologin", user])
     if not TEST:
+        run(["usermod", "-a", "-G", DATA_GROUP, user])
         ensure_subids(user)
         run(["loginctl", "enable-linger", user])
     data = ROOT / "data" / name
@@ -205,26 +254,29 @@ def stage(name, source=None, template=False, commit=None):
         if not Path(source).is_dir():
             raise ValueError("Source must be a local git repository")
         if bare.exists():
-            run(["git", "-C", bare, "fetch", source, "+refs/heads/*:refs/heads/*"])
+            run(["git", "-c", f"safe.directory={bare}", "-c", f"safe.directory={Path(source).resolve()}", "-C", bare, "fetch", source, "+refs/heads/*:refs/heads/*"])
         else:
-            run(["git", "clone", "--bare", source, bare])
+            run(["git", "-c", f"safe.directory={Path(source).resolve()}", "clone", "--bare", source, bare])
     elif not bare.exists():
         raise ValueError("No source repository; use --source or --template")
     if not TEST:
         run(["chown", "-R", "builder:builder", bare])
-    resolved = run(["git", "-C", bare, "rev-parse", "--verify", (commit or "HEAD") + "^{commit}"], capture=True).stdout.strip()
+    resolved = run(["git", "-c", f"safe.directory={bare}", "-C", bare, "rev-parse", "--verify", (commit or "HEAD") + "^{commit}"], capture=True).stdout.strip()
     if not HASH.fullmatch(resolved):
         raise ValueError("Invalid commit")
     target = ROOT / "staging" / name / resolved
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "--quiet", "--no-hardlinks", bare, target])
+        run(["git", "-c", f"safe.directory={bare}", "clone", "--quiet", "--no-hardlinks", bare, target])
         run(["git", "-C", target, "checkout", "--quiet", "--detach", resolved])
         if not TEST:
             run(["chown", "-R", "builder:builder", target])
     safe_tree(target)
     test_tool(target, user="builder")
-    data = registry(); item = entry(data, name); item["staged"] = resolved; item["tests_ok"] = True; save_registry(data)
+    data = registry(); item = entry(data, name); item["staged"] = resolved; item["tests_ok"] = True
+    if not item.get("port"):
+        item["port"] = allocate_port(data)
+    save_registry(data)
     audit("stage", name, commit=resolved)
     print(resolved)
 
@@ -237,7 +289,7 @@ def safe_tree(path):
 
 def materialize_commit(bare, commit, destination):
     """Extract only tracked files from the immutable Git commit object."""
-    archive = subprocess.run(["git", "-C", str(bare), "archive", "--format=tar", commit], capture_output=True, check=True).stdout
+    archive = subprocess.run(["git", "-c", f"safe.directory={bare}", "-C", str(bare), "archive", "--format=tar", commit], capture_output=True, check=True).stdout
     destination.mkdir(parents=True, exist_ok=False)
     import io
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as members:
@@ -347,7 +399,7 @@ def publish(name, client, reviewer=None, ack_unreviewed=False):
         raise ValueError("Reviewer signature invalid")
     review = reviewer if reviewer else "unreviewed-client-ack"
     bare = ROOT / "src" / (name + ".git")
-    if run(["git", "-C", bare, "cat-file", "-t", commit], capture=True).stdout.strip() != "commit":
+    if run(["git", "-c", f"safe.directory={bare}", "-C", bare, "cat-file", "-t", commit], capture=True).stdout.strip() != "commit":
         raise ValueError("Staged commit is not in the tool repository")
     clean_parent = Path(tempfile.mkdtemp(prefix=".publish-", dir=ROOT / "staging" / name))
     clean = clean_parent / "code"
@@ -409,14 +461,15 @@ def _publish_checked(name, client, reviewer, ack_unreviewed, data, item, commit,
         temp_link.unlink(missing_ok=True)
         temp_link.symlink_to(release)
         temp_link.replace(current)
+        port = item.get("port") or allocate_port(data)
         if not TEST:
-            install_service(name, user, item.get("port", 8800 + len(data["tools"])))
+            install_service(name, user, port)
             run(["systemctl", "restart", f"hermes-kit-tool-{name}.service"])
-            if not origin_denies_without_token(item.get("port", 8800 + len(data["tools"]))):
+            if not origin_denies_without_token(port):
                 raise ValueError("Tool origin failed its no-token health check")
         item.update({"commit": commit, "previous": previous or "none", "version": commit[:12], "up": True,
                      "tests_ok": True, "scan": scan_result, "snapshot_sha256": checksum, "snapshot_file": snap.name, "last_snapshot": stamp(), "reviewer": review,
-                     "code_hash": hash_tree(release), "port": item.get("port", 8800 + len(data["tools"]))})
+                     "code_hash": hash_tree(release), "port": port})
         save_registry(data)
         if not TEST:
             backup({name})
