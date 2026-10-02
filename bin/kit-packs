@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""List and apply client pack selections; root-only on installed kits."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+KIT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(KIT / "lib"))
+from hermes_runtime import HERMES_BIN  # noqa: E402
+from kit_packs import catalog, choose, prune_installed, read_state, unmet_needs, write_state  # noqa: E402
+from kit_profile import profile as apply_profile  # noqa: E402
+
+SOURCE = KIT / "profile"
+STATE = Path(os.environ.get("KIT_PACKS_STATE", "/etc/hermes-kit/packs.json"))
+CONSENTS = Path(os.environ.get("KIT_PACKS_CONSENTS", "/etc/hermes-kit/consents.json"))
+STAGED = Path(os.environ.get("KIT_PACKS_STAGE", "/var/lib/hermes-kit/profile-source"))
+INSTALLED = Path(os.environ.get("KIT_PACKS_INSTALLED", "/home/hermes/.hermes/profiles/client"))
+TEST = os.environ.get("KIT_PACKS_TEST_MODE") == "1"
+
+
+def assistant_name() -> str:
+    if TEST:
+        return os.environ.get("KIT_PACKS_ASSISTANT_NAME", "")
+    config = Path("/etc/hermes-kit/kit.conf")
+    if config.is_file():
+        for line in config.read_text().splitlines():
+            if line.startswith("ASSISTANT_NAME="):
+                value = line.split("=", 1)[1]
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                return value
+    return ""
+
+
+def reapply(selection: dict) -> None:
+    if STAGED.exists():
+        # This directory is the kit's generated profile source, not client data.
+        shutil.rmtree(STAGED)
+    shutil.copytree(SOURCE, STAGED, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    name = assistant_name()
+    apply_profile(SOURCE, STAGED, name, False, selection)
+    if TEST:
+        INSTALLED.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(STAGED / "skills", INSTALLED / "skills", dirs_exist_ok=True)
+        for file in ("SOUL.md", "SKILLS.sha256"):
+            shutil.copy2(STAGED / file, INSTALLED / file)
+    else:
+        command = ["runuser", "-u", "hermes", "--", "env",
+                   "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes",
+                   "PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin", HERMES_BIN]
+        subprocess.run([*command, "profile", "update", "client", "--yes"], check=True)
+        subprocess.run([*command, "profile", "use", "client"], check=True)
+    prune_installed(SOURCE, INSTALLED, selection, CONSENTS)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="kit-packs")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("list")
+    setter = sub.add_parser("set")
+    setter.add_argument("packs")
+    setter.add_argument("--consent-id", required=True)
+    args = parser.parse_args()
+    if os.geteuid() != 0 and not TEST:
+        raise ValueError("kit-packs must run as root during setup or through the support path")
+    selected = read_state(SOURCE, STATE)
+    data = catalog(SOURCE)
+    if args.action == "list":
+        print("PACK\tON/OFF\tWHAT IT DOES")
+        for pack in data["packs"]:
+            print(f"{pack['id']}\t{'on' if pack['id'] in selected['packs'] else 'off'}\t{pack['promise']}")
+        return
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", args.consent_id):
+        raise ValueError("Invalid consent ID")
+    ledger = json.loads(CONSENTS.read_text()) if CONSENTS.is_file() else {"consents": []}
+    if not any(row.get("consent_id") == args.consent_id and row.get("integration") == "packs" for row in ledger.get("consents", [])):
+        raise ValueError("Record pack choice consent with kit-consent add packs --consent-id first")
+    updated = choose(SOURCE, selected["segment"], args.packs)
+    updated["consent_id"] = args.consent_id
+    reapply(updated)
+    write_state(STATE, updated)
+    for pack, needs in unmet_needs(updated, CONSENTS).items():
+        print(f"Sam still needs to switch on {', '.join(needs)} for {pack} through the existing consent path.")
+    print("Pack selection applied.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"kit-packs: {error}", file=sys.stderr)
+        sys.exit(1)

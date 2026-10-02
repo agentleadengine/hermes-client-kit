@@ -5,6 +5,7 @@ provides_hooks:
   - pre_tool_call
 provides_tools:
   - starter_site_preview
+  - starter_site_check
   - starter_site_publish
   - starter_site_undo
   - starter_make_video
@@ -13,3 +14,4 @@ provides_tools:
   - starter_tool_stage
   - starter_tool_publish
   - starter_tool_rollback
+  - starter_design_system

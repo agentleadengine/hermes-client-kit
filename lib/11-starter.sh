@@ -27,6 +27,14 @@ sys.path.insert(0, sys.argv[1])
 from kit_powerup import local_chromium
 local_chromium()
 PY
+if [[ -f /etc/hermes-kit/consents.json ]] && jq -e '.consents[]? | select(.integration == "builder" or .integration == "website")' /etc/hermes-kit/consents.json >/dev/null; then
+  python3 - "$KIT_RUNTIME_DIR/lib" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from kit_powerup import install_builder_qa
+install_builder_qa()
+PY
+fi
 install -d -m 0755 "$starter_root/usr/share/keyrings" "$starter_root/etc/apt/sources.list.d"
 key_tmp=$(mktemp)
 curl --fail --silent --show-error --location --retry 6 --retry-all-errors --retry-delay 5 --retry-max-time 300 https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg --output "$key_tmp"

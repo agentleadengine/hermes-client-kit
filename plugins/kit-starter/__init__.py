@@ -19,6 +19,8 @@ LEDGER = Path("/etc/hermes-kit/consents.json")
 TOOLS = Path("/home/hermes/vault/tools")
 SOCKET = "/run/hermes-kit/starter.sock"
 NAME = re.compile(r"[a-z][a-z0-9-]{1,31}\Z")
+DESIGN_SEARCH = Path("/home/hermes/.hermes/profiles/client/skills/design/ui-ux-pro-max/scripts/search.py")
+QA_PYTHON = Path("/opt/hermes-kit/qa-venv/bin/python")
 
 
 def consent(name):
@@ -81,6 +83,30 @@ def site_publish(args, **kwargs):
         raise ValueError("Netlify consent is missing")
     kit_website.approve()
     return json.dumps(kit_website.read().get("last_deploy"))
+
+
+def site_check(args, **kwargs):
+    del args, kwargs
+    if not consent("website"):
+        raise ValueError("Website consent is missing")
+    state = kit_website.read()
+    commit = state.get("preview_commit", "")
+    if not state.get("preview") or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("Create a website preview first")
+    actual = subprocess.run(["git", "-C", str(kit_website.ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    if actual != commit:
+        raise ValueError("Website preview changed; preview it again")
+    dirty = subprocess.run(["git", "-C", str(kit_website.ROOT), "status", "--porcelain", "-z"], capture_output=True, check=True).stdout
+    if dirty:
+        raise ValueError("Website draft changed after preview; create a new preview")
+    output = Path("/home/hermes/vault/media/site-previews") / commit
+    if output.is_symlink() or not output.resolve().is_relative_to(Path("/home/hermes/vault").resolve()):
+        raise ValueError("Unsafe website preview output")
+    checker = Path(__file__).resolve().parent / "kit_site_check.py"
+    result = subprocess.run([str(QA_PYTHON), str(checker), str(output)], capture_output=True, text=True, timeout=60, check=True)
+    if len(result.stdout) > 8000:
+        raise ValueError("Website check produced too many issues to report")
+    return result.stdout
 
 
 def site_undo(args, **kwargs):
@@ -153,11 +179,30 @@ def tool_rollback(args, **kwargs):
     return json.dumps(bridge("rollback", args["name"], client="client"))
 
 
+def design_system(args, **kwargs):
+    del kwargs
+    if not (consent("builder") or consent("website")):
+        raise ValueError("Builder or Website consent is required")
+    query = args["query"].strip()
+    if not 3 <= len(query) <= 120 or "\n" in query or "\r" in query:
+        raise ValueError("Use a short product-type description")
+    if not DESIGN_SEARCH.is_file():
+        raise ValueError("Vendored design search is missing")
+    result = subprocess.run(
+        [sys.executable, str(DESIGN_SEARCH), query, "--design-system", "--json"],
+        capture_output=True, text=True, timeout=20, check=True,
+    )
+    if len(result.stdout) > 16000:
+        raise ValueError("Design result is too large; use a narrower product description")
+    return result.stdout
+
+
 def register(ctx):
     from tools.registry import registry
     ctx.register_hook("pre_tool_call", guard)
     definitions = (
         ("starter_site_preview", "Prepare a local website preview from changed vault website files.", {}, site_preview),
+        ("starter_site_check", "Check the current local website preview at phone and desktop widths.", {}, site_check),
         ("starter_site_publish", "Publish the approved preview to the client's Netlify site.", {}, site_publish),
         ("starter_site_undo", "Redeploy the previous client website version.", {}, site_undo),
         ("starter_make_video", "Make a captioned MP4 from a vault text script.", {"script": {"type": "string"}, "output": {"type": "string"}, "voice": {"type": "boolean"}}, make_video),
@@ -166,6 +211,7 @@ def register(ctx):
         ("starter_tool_stage", "Stage and test a committed client tool.", {"name": {"type": "string"}, "commit": {"type": "string"}}, tool_stage),
         ("starter_tool_publish", "Publish an approved staged tool to the client tailnet.", {"name": {"type": "string"}, "commit": {"type": "string"}}, tool_publish),
         ("starter_tool_rollback", "Roll back a client tool's code.", {"name": {"type": "string"}}, tool_rollback),
+        ("starter_design_system", "Search the vendored local design catalog for a product type; no network or file writes.", {"query": {"type": "string"}}, design_system),
     )
     for name, description, properties, handler in definitions:
         schema = {"description": description, "parameters": {"type": "object", "additionalProperties": False, "properties": properties, "required": [key for key, value in properties.items() if key != "voice"]}}

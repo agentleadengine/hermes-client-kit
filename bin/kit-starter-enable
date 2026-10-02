@@ -20,7 +20,7 @@ def main():
         parser.error("Run as root during the client setup window")
     if not args.consent_id or not all(character.isalnum() or character in "._-" for character in args.consent_id) or len(args.consent_id) > 80:
         parser.error("Use a simple consent record ID")
-    for capability in ("tailscale", "builder", "website", "netlify", "media"):
+    for capability in ("tailscale", "builder", "website", "netlify", "media", "schedules"):
         on(capability, None, args.client, confirmation="setup:" + args.consent_id)
     print("Starter capabilities recorded for the client. Netlify and Tailscale still need client-owned setup keys.")
 

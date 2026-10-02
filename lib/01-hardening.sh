@@ -99,6 +99,6 @@ systemctl daemon-reload
 systemctl enable --now hermes-kit-access-log.timer
 systemctl start hermes-kit-access-log.service
 
-for helper in kit-set-key kit-verify kit-update kit-offboard kit-mailroom-setup kit-agentmail-lists kit-consent kit-lockdown kit-access-log; do
+for helper in kit-set-key kit-verify kit-update kit-offboard kit-mailroom-setup kit-agentmail-lists kit-consent kit-brief kit-packs kit-lockdown kit-access-log; do
   ln -sfn "$KIT_RUNTIME_DIR/bin/$helper" "/usr/local/bin/$helper"
 done

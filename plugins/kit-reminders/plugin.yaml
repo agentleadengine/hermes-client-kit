@@ -1,0 +1,5 @@
+name: kit-reminders
+version: "1.0"
+description: Enforce owner-only scheduled messages.
+provides_hooks:
+  - pre_tool_call

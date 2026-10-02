@@ -10,6 +10,9 @@ MODEL_PROVIDER="opencode-zen"
 MODEL_NAME=""
 # care, managed, full. Existing ludicrous installs are treated as full.
 KIT_TIER="care"
+# Choose a business segment; an empty KIT_PACKS uses its catalog defaults.
+KIT_SEGMENT="other"
+KIT_PACKS=""
 KIT_AGENT_ID=""
 KIT_ENROLL_CODE=""
 KIT_HQ_URL=""

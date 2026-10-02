@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import termios
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,6 +21,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from kit_powerup import BASE_TOOLS, config_set, consents  # noqa: E402
+from kit_reminders import origin_target, owner_target_from_values  # noqa: E402
 
 CONFIG = Path("/etc/hermes-kit/kit.conf")
 ENV = Path("/home/hermes/.hermes/profiles/client/.env")
@@ -28,6 +30,9 @@ BOT_TOKEN = re.compile(r"[0-9]{6,12}:[A-Za-z0-9_-]{30,}\Z")
 TELEGRAM_ID = re.compile(r"[0-9]{5,15}\Z")
 E164 = re.compile(r"\+[1-9][0-9]{6,14}\Z")  # ASCII E.164 subset of Hermes photon/auth.py E164_RE
 PROJECT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+HERMES_BIN = "/home/hermes/.local/bin/hermes"
+DEVICE_PREFIX = ["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes",
+                 "PYTHONUNBUFFERED=1", "NPM_CONFIG_CACHE=/home/hermes/.hermes/cache/npm"]
 
 
 class ChatError(Exception):
@@ -101,6 +106,31 @@ def write_config(platform: str, user: str) -> None:
         os.replace(temp, CONFIG)
     finally:
         temp.unlink(missing_ok=True)
+
+
+def retarget_owner_jobs(old_target: str, new_target: str) -> None:
+    """Keep existing owner reminders on the one newly approved chat."""
+    path = Path("/home/hermes/.hermes/profiles/client/cron/jobs.json")
+    if not old_target or old_target == new_target or not path.exists():
+        return
+    document = json.loads(path.read_text())
+    jobs = document if isinstance(document, list) else document.get("jobs", [])
+    for job in jobs:
+        old_delivery = job.get("deliver") == old_target or (job.get("deliver") == "origin" and origin_target(job.get("origin")) == old_target)
+        old_failure = job.get("failure_deliver") == old_target or (job.get("failure_deliver") == "origin" and origin_target(job.get("origin")) == old_target)
+        if not old_delivery and not old_failure:
+            continue
+        prefix = ["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes",
+                  "/home/hermes/.local/bin/hermes", "-p", "client", "cron"]
+        if not new_target and job.get("enabled") is not False and not run(prefix + ["pause", str(job["id"])]):
+            raise ChatError("Reminders could not be paused during chat disconnect.")
+        edit = prefix + ["edit", str(job["id"])]
+        if old_delivery:
+            edit.extend(["--deliver", new_target or "local"])
+        if old_failure:
+            edit.extend(["--failure-deliver", new_target or "local"])
+        if not run(edit):
+            raise ChatError("Reminders could not be moved to the owner's new chat.")
 
 
 def clear_photon_auth() -> None:
@@ -188,13 +218,6 @@ def telegram_check(user: str) -> None:
     me = request_json(base + "/getMe")
     if not isinstance(me, dict) or me.get("ok") is not True:
         raise ChatError("Telegram rejected the bot token. Copy a fresh token from @BotFather.")
-    try:
-        sent = request_json(base + "/sendMessage", data={"chat_id": user, "text": "Hi, I'm your assistant. Text me anytime."},
-                            headers={"Content-Type": "application/json"})
-    except ChatError:
-        raise ChatError("Bot verified, but the hello message could not be sent. Open your bot in Telegram, tap Start, then try again.") from None
-    if not isinstance(sent, dict) or sent.get("ok") is not True:
-        raise ChatError("Bot verified, but Telegram could not send the hello message. Open your bot, tap Start, then try again.")
 
 
 def photon_check(project: str, secret: str, phone: str) -> tuple[str, str]:
@@ -232,41 +255,29 @@ def photon_check(project: str, secret: str, phone: str) -> tuple[str, str]:
     return (line if isinstance(line, str) and E164.fullmatch(line) else "", safe_id)
 
 
-def photon_hello(phone: str) -> bool:
-    """True only for Photon's expected shared-line first-contact refusal."""
-    args = ["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes",
-            "/home/hermes/.local/bin/hermes", "-p", "client", "send", "--to", "photon:" + phone,
-            "Hi, I'm your assistant. Text me anytime."]
-    try:
-        result = subprocess.run(args, text=True, capture_output=True, timeout=45, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        raise ChatError("Photon is connected, but the hello could not be sent. Please retry setup.") from None
-    if result.returncode == 0:
-        return False
-    detail = (result.stdout + result.stderr).lower()
-    if "target_not_allowed" in detail or "shared/free-tier photon lines cannot initiate" in detail:
-        return True
-    raise ChatError("Photon is connected, but the hello could not be sent. Please retry setup.")
-
-
 def photon_hi_link(user_id: str) -> str:
     if not user_id:
         return ""
     return "https://spectrum.photon.codes/users/" + urllib.parse.quote(user_id, safe="") + "/redirect?msg=Hi"
 
 
-def connect(data: dict) -> tuple[bool, str]:
+def connect(data: dict, *, device_login: bool = False) -> tuple[bool, str]:
     platform, values = validate(data)
     STATE.mkdir(mode=0o751, parents=True, exist_ok=True)
     with (STATE / "chat-connect.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        old = config_values().get("MESSAGING_PLATFORM", "none")
+        old_values = config_values()
+        old = old_values.get("MESSAGING_PLATFORM", "none")
+        old_target = owner_target_from_values(old_values)
         if platform == "none":
             clear_photon_auth()
             for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS", "PHOTON_PROJECT_ID", "PHOTON_PROJECT_SECRET",
                         "PHOTON_ALLOWED_USERS", "PHOTON_HOME_CHANNEL"):
                 key_write(key, None)
             write_config("none", "")
+            retarget_owner_jobs(old_target, "")
+            if old in {"photon", "telegram"}:
+                config_set("platform_toolsets." + old, BASE_TOOLS + (["browser"] if any(c.get("integration") == "logins" for c in consents().get("consents", [])) else []))
             (STATE / "chat-connected.sha256").unlink(missing_ok=True)
             (STATE / "chat-line.txt").unlink(missing_ok=True)
             if old != "none":
@@ -281,10 +292,14 @@ def connect(data: dict) -> tuple[bool, str]:
 
         fingerprint = hashlib.sha256(json.dumps([platform, values], sort_keys=True).encode()).hexdigest()
         marker = STATE / "chat-connected.sha256"
-        clear_photon_auth()
+        if not device_login:
+            clear_photon_auth()
         if marker.exists() and marker.read_text().strip() == fingerprint and old == platform:
             if not run(["/usr/local/bin/kit-verify", "--json"], timeout=180):
                 raise ChatError("The chat connection is no longer healthy. Contact your setup guide.")
+            if any(c.get("integration") == "schedules" for c in consents().get("consents", [])):
+                from kit_powerup import seed_schedule_jobs
+                seed_schedule_jobs()
             return True, "Connected. Your chat app is already set up."
         # Probe Photon credentials and register the authorized user before changing local state.
         line, user_id = "", ""
@@ -295,7 +310,11 @@ def connect(data: dict) -> tuple[bool, str]:
             key_write(key, values.get(key))
         user = values["TELEGRAM_ALLOWED_USERS" if platform == "telegram" else "PHOTON_ALLOWED_USERS"]
         write_config(platform, user)
-        tools = BASE_TOOLS + (["browser"] if any(c.get("integration") == "logins" for c in consents().get("consents", [])) else [])
+        if any(c.get("integration") == "schedules" for c in consents().get("consents", [])):
+            retarget_owner_jobs(old_target, owner_target_from_values(config_values()))
+        if old != platform and old in {"photon", "telegram"}:
+            config_set("platform_toolsets." + old, BASE_TOOLS + (["browser"] if any(c.get("integration") == "logins" for c in consents().get("consents", [])) else []))
+        tools = BASE_TOOLS + (["browser"] if any(c.get("integration") == "logins" for c in consents().get("consents", [])) else []) + (["cronjob"] if any(c.get("integration") == "schedules" for c in consents().get("consents", [])) else [])
         config_set("platform_toolsets." + platform, tools)
         if platform == "photon":
             # Hermes can install the pinned sidecar dependencies without dashboard credentials.
@@ -307,30 +326,103 @@ def connect(data: dict) -> tuple[bool, str]:
             raise ChatError("Settings were saved, but the assistant could not start. Contact your setup guide.")
         if platform == "telegram":
             telegram_check(user)
-            message = "Connected. Check your phone for a hello message."
+            message = "Connected. Open your bot, tap Start, then text Hi to receive your personal welcome."
         elif not line:
             raise ChatError("Photon accepted your details, but has not assigned a chat number yet. Check your Photon dashboard and return here.")
         if not run(["/usr/local/bin/kit-verify", "--json"], timeout=180):
             raise ChatError("The chat details were saved, but a server safety check needs attention. Contact your setup guide.")
         if platform == "photon":
-            needs_first_text = photon_hello(user)
-            if needs_first_text:
-                message = "Connected. Ask the client to text 'hi' to " + line + " once"
-                link = photon_hi_link(user_id)
-                if link:
-                    message += ". Open the prefilled message: " + link
-            else:
-                message = "Connected. Check your phone for a hello message from " + line + "."
+            message = "Connected. Text Hi to " + line + " from your allowlisted phone to receive your personal welcome."
+            link = photon_hi_link(user_id)
+            if link:
+                message += " Open the prefilled message: " + link
             (STATE / "chat-line.txt").write_text(line + "\n")
             (STATE / "chat-line.txt").chmod(0o600)
         else:
             (STATE / "chat-line.txt").unlink(missing_ok=True)
+        if any(c.get("integration") == "schedules" for c in consents().get("consents", [])):
+            from kit_powerup import seed_schedule_jobs
+            seed_schedule_jobs()
         marker.write_text(fingerprint + "\n")
         marker.chmod(0o600)
         append_event("chat-app-connected", platform)
         run(["/usr/local/bin/kit-access-log"])
         run(["/usr/local/bin/kit-health"])
-        return True, message
+    return True, message
+
+
+def device_credentials(phone: str) -> dict:
+    project = None
+    for auth in (Path("/home/hermes/.hermes/profiles/client/auth.json"), Path("/home/hermes/.hermes/auth.json")):
+        if auth.exists():
+            data = json.loads(auth.read_text())
+            candidate = data.get("credential_pool", {}).get("photon_project")
+            if isinstance(candidate, list):
+                candidate = candidate[0] if candidate else None
+            if isinstance(candidate, dict) and candidate.get("project_secret"):
+                project = candidate
+                break
+    if project is None:
+        raise ChatError("Photon setup did not save a project. Try again.")
+    return {"platform": "photon", "phone": phone,
+            "project_id": project.get("spectrum_project_id") or project.get("project_id", ""),
+            "project_secret": project.get("project_secret", "")}
+
+
+def device_state(**values):
+    path = STATE / "photon-device.json"
+    STATE.mkdir(mode=0o751, parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".new")
+    temp.write_text(json.dumps(values) + "\n")
+    temp.chmod(0o600)
+    temp.replace(path)
+
+
+def device_worker(phone: str, *, echo: bool = False) -> bool:
+    if not E164.fullmatch(phone):
+        raise ChatError("Enter an international phone number such as +15551234567.")
+    device_state(status="waiting", phone=phone, url="", code="")
+    command = DEVICE_PREFIX + [HERMES_BIN, "-p", "client", "photon", "setup", "--phone", phone, "--no-browser"]
+    try:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
+            url = code = ""
+            for line in process.stdout:
+                match = re.search(r"https://app\.photon\.codes/[^\s│]*", line)
+                if match:
+                    url = match.group().rstrip(".,)")
+                match = re.search(r"Enter the code:\s*([A-Za-z0-9-]{4,20})", line)
+                if match:
+                    code = match.group(1)
+                if url or code:
+                    device_state(status="waiting", phone=phone, url=url, code=code)
+                    if echo and (match or "Open this URL:" in line):
+                        print(f"Open this on your phone and tap Approve: {url}  Code: {code}", flush=True)
+            if process.wait(timeout=300) != 0:
+                raise ChatError("Photon device approval or setup did not complete. Try again.")
+        ok, message = connect(device_credentials(phone), device_login=True)
+        device_state(status="connected" if ok else "failed", phone=phone, url=url, code=code, message=message)
+        if echo:
+            print(message, flush=True)
+        return ok
+    except (OSError, subprocess.TimeoutExpired, ValueError, ChatError) as error:
+        device_state(status="failed", phone=phone, url="", code="", message="Photon setup did not complete. Try again or contact your setup guide.")
+        if echo:
+            print(str(error), file=sys.stderr)
+        return False
+
+
+def start_device_worker(phone: str) -> tuple[bool, str]:
+    if not E164.fullmatch(phone):
+        raise ChatError("Enter an international phone number such as +15551234567.")
+    state_path = STATE / "photon-device.json"
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+        if state.get("status") == "waiting" and state.get("phone") == phone and time.time() - state_path.stat().st_mtime < 600:
+            return True, "Waiting for Photon approval. Refresh this page to see the link and code."
+    device_state(status="waiting", phone=phone, url="", code="")
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--device-worker", phone],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return True, "Photon approval started. Refresh this page for the link and code."
 
 
 def append_event(kind: str, platform: str) -> None:
@@ -355,13 +447,19 @@ def hidden_prompt(label: str) -> str:
 def main() -> int:
     if os.geteuid() != 0:
         return 1
+    if len(sys.argv) == 3 and sys.argv[1] == "--device-worker":
+        return 0 if device_worker(sys.argv[2]) else 1
     cli = bool(sys.argv[1:])
     try:
         if cli:
-            if len(sys.argv) != 4 or sys.argv[1:3] != ["--photon", "--phone"] or not sys.stdin.isatty():
-                raise ChatError("Usage: sudo kit-chat-connect --photon --phone +15551234567 (from a terminal)")
+            if len(sys.argv) not in (4, 5) or sys.argv[1:3] != ["--photon", "--phone"]:
+                raise ChatError("Usage: kit-chat-connect --photon --phone +15551234567 [--device-login|--manual]")
             phone = sys.argv[3]
-            # Both fields are read from the operator's terminal with echo disabled.
+            mode = sys.argv[4] if len(sys.argv) == 5 else "--device-login"
+            if mode == "--device-login":
+                return 0 if device_worker(phone, echo=True) else 1
+            if mode != "--manual" or not sys.stdin.isatty():
+                raise ChatError("Use --manual from a terminal for project credentials.")
             project = hidden_prompt("Photon Spectrum project ID: ")
             secret = hidden_prompt("Photon project secret: ")
             data = {"platform": "photon", "phone": phone, "project_id": project, "project_secret": secret}
@@ -369,7 +467,10 @@ def main() -> int:
             data = json.load(sys.stdin)
         if not isinstance(data, dict):
             raise ChatError("Invalid form. Please try again.")
-        ok, message = connect(data)
+        if not cli and data.get("platform") == "photon" and data.get("mode", "device-login") == "device-login":
+            ok, message = start_device_worker(data.get("phone", ""))
+        else:
+            ok, message = connect(data)
     except ChatError as error:
         ok, message = False, str(error)
     except Exception:

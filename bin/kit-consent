@@ -9,11 +9,13 @@ command=${1:-}
 integration=${2:-}
 mcp_server=
 mcp_platforms=cli
+consent_id=
 if [[ $command == add ]]; then
   shift $(( $# < 2 ? $# : 2 ))
   while [[ $# -gt 0 ]]; do
     case $1 in
       --mcp-server) mcp_server=${2:-}; shift 2 ;;
+      --consent-id) consent_id=${2:-}; shift 2 ;;
       --platforms) mcp_platforms=${2:-}; shift 2 ;;
       *) echo 'Usage: kit-consent add <integration> [--mcp-server name] [--platforms cli,telegram]' >&2; exit 2 ;;
     esac
@@ -33,6 +35,8 @@ case $command in
   add)
     [[ -n $integration && $integration =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'Usage: kit-consent add <integration>' >&2; exit 1; }
     case $integration in base|builder|website|schedules|logins) echo 'Use kit-powerup for this capability.' >&2; exit 1 ;; esac
+    [[ -z $consent_id || $consent_id =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo 'Invalid consent ID.' >&2; exit 1; }
+    if [[ $integration == brief-memory && -z $consent_id ]]; then echo 'brief-memory requires --consent-id.' >&2; exit 1; fi
     [[ -z $mcp_server || $mcp_server =~ ^[A-Za-z][A-Za-z0-9_-]{0,63}$ ]] || { echo 'Invalid MCP server name.' >&2; exit 1; }
     [[ -n $mcp_server || $mcp_platforms == cli ]] || { echo '--platforms requires --mcp-server.' >&2; exit 1; }
     read -r -p 'Client name: ' client_name
@@ -52,8 +56,8 @@ case $command in
     platforms_json=$(printf '%s' "$mcp_platforms" | jq -Rc 'split(",") | map(gsub("^ +| +$"; "")) | map(select(length > 0)) | unique')
     had_mcp=$(jq -r --arg integration "$integration" '.consents[]? | select(.integration == $integration) | .mcp_server // empty' "$ledger")
     tmp=$(mktemp "$ledger.XXXXXX")
-    jq --arg client_name "$client_name" --arg date "$(date -u +%F)" --arg integration "$integration" --arg risk_level "$risk_level" --arg warning "$warning" --arg confirmation "$confirmation" --arg mcp_server "$mcp_server" --argjson mcp_platforms "$platforms_json" --argjson scopes "$scopes_json" \
-      '.consents = ((.consents // []) | map(select(.integration != $integration)) + [{client_name: $client_name, date: $date, integration: $integration, scopes: $scopes, risk_level: $risk_level, warnings_shown: $warning, confirmation: $confirmation} + (if $mcp_server == "" then {} else {mcp_server: $mcp_server, mcp_platforms: $mcp_platforms} end)])' "$ledger" > "$tmp"
+    jq --arg client_name "$client_name" --arg date "$(date -u +%F)" --arg integration "$integration" --arg risk_level "$risk_level" --arg warning "$warning" --arg confirmation "$confirmation" --arg mcp_server "$mcp_server" --arg consent_id "$consent_id" --argjson mcp_platforms "$platforms_json" --argjson scopes "$scopes_json" \
+      '.consents = ((.consents // []) | map(select(.integration != $integration)) + [{client_name: $client_name, date: $date, integration: $integration, scopes: $scopes, risk_level: $risk_level, warnings_shown: $warning, confirmation: $confirmation} + (if $consent_id == "" then {} else {consent_id: $consent_id} end) + (if $mcp_server == "" then {} else {mcp_server: $mcp_server, mcp_platforms: $mcp_platforms} end)])' "$ledger" > "$tmp"
     if [[ -n $mcp_server || -n $had_mcp ]] && ! python3 - "$kit_dir/lib" "$tmp" "$mcp_server" <<'PY'
 import json, sys
 sys.path.insert(0, sys.argv[1])

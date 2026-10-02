@@ -1,0 +1,6 @@
+name: kit-welcome
+version: "1.0"
+description: One-time personal welcome on the owner's first chat reply.
+provides_hooks:
+  - transform_llm_output
+  - api_request_error

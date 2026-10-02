@@ -192,6 +192,8 @@ def approve():
     require(); state = read()
     if not state.get("preview"):
         raise ValueError("No preview pending")
+    if run("status", "--porcelain", "-z", capture=True).stdout:
+        raise ValueError("Website draft changed after preview; create a new preview")
     if state.get("remote"):
         run("fetch", "origin", state["main"])
         if run("rev-parse", "FETCH_HEAD", capture=True).stdout.strip() != state["base"]:

@@ -340,7 +340,9 @@ def make_release_readonly(path):
 def test_tool(path, user=None):
     if not (path / "tests").is_dir():
         raise ValueError("Tool has no tests")
-    run(["python3", "-m", "unittest", "discover", "-s", "tests", "-v"], cwd=path, user=user)
+    qa_python = Path("/opt/hermes-kit/qa-venv/bin/python")
+    python = str(qa_python) if qa_python.is_file() else "python3"
+    run([python, "-m", "unittest", "discover", "-s", "tests", "-v"], cwd=path, user=user)
 
 
 def migration_files(path):

@@ -2,13 +2,14 @@
 
 log 'Installing the Hermes profile distribution and client-profile baseline'
 profile_source=/var/lib/hermes-kit/profile-source
+python3 "$KIT_DIR/lib/kit_packs.py" init "$KIT_DIR/profile" /etc/hermes-kit/packs.json "${KIT_SEGMENT:-other}" "${KIT_PACKS:-}"
 # Hermes records the absolute source directory in distribution.yaml. Keep that
 # directory stable across kit releases and render the name before Hermes reads it.
 install -d -m 0755 /var/lib/hermes-kit
 rm -rf -- "$profile_source"
 install -d -m 0755 "$profile_source"
 cp -a "$KIT_DIR/profile/." "$profile_source/"
-python3 "$KIT_DIR/lib/kit_profile.py" install "$KIT_DIR/profile" "$profile_source" "${ASSISTANT_NAME:-}"
+python3 "$KIT_DIR/lib/kit_profile.py" install "$KIT_DIR/profile" "$profile_source" "${ASSISTANT_NAME:-}" --selection /etc/hermes-kit/packs.json
 chmod -R a+rX "$profile_source"
 
 # The marker must precede update/install so Hermes does not seed bundled skills.
@@ -34,6 +35,7 @@ else
   fi
 fi
 run_as_hermes_root "'$HERMES_BIN' profile use '$HERMES_PROFILE_NAME'"
+python3 "$KIT_DIR/lib/kit_packs.py" prune "$KIT_DIR/profile" "$HERMES_HOME" /etc/hermes-kit/packs.json /etc/hermes-kit/consents.json
 install -m 0644 -o "$HERMES_USER" -g "$HERMES_USER" "$KIT_DIR/profile/GUIDE.md" "$HERMES_HOME/GUIDE.md"
 install -m 0644 -o "$HERMES_USER" -g "$HERMES_USER" "$KIT_DIR/profile/NOTICE" "$HERMES_HOME/NOTICE"
 chown -R "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/SOUL.md" "$HERMES_HOME/distribution.yaml" "$HERMES_HOME/SKILLS.sha256" "$HERMES_HOME/skills/hermes/hermes-starter-onboarding/SKILL.md"
@@ -53,7 +55,7 @@ chmod 0644 /etc/hermes-kit/official-agentmail.sha256
 # existed. Remove only non-baseline, unconsented skills; consented client
 # additions and the deliberately installed AgentMail skill are retained.
 while IFS= read -r skill; do
-  if grep -Fqx "$skill" < <(awk '{print $2}' "$KIT_DIR/profile/SKILLS.sha256") || [[ $skill == skills/email/agentmail/SKILL.md ]]; then
+  if grep -Fqx "$skill" < <(awk '{print $2}' "$profile_source/SKILLS.sha256") || [[ $skill == skills/email/agentmail/SKILL.md ]]; then
     continue
   fi
   integration=${skill#skills/}
@@ -63,6 +65,7 @@ while IFS= read -r skill; do
   fi
   rm -rf -- "$HERMES_HOME/skills/${skill#skills/}"
 done < <(cd "$HERMES_HOME" && find skills -type f -name SKILL.md -printf 'skills/%P\n' | sort)
+python3 "$KIT_DIR/lib/kit_packs.py" needs "$KIT_DIR/profile" /etc/hermes-kit/packs.json /etc/hermes-kit/consents.json
 # The SDK is the restricted transport used by the user service below. It reads
 # only the inbox-scoped key; the LLM cron job never receives a terminal tool.
 # Ubuntu 24.04 blocks pip into system Python (PEP 668); the mailroom gets its own venv.
@@ -101,4 +104,37 @@ fi
 if [[ $MESSAGING_PLATFORM == photon ]]; then
   set_env_value PHOTON_NODE_BIN /home/hermes/.hermes/node/bin/node "$HERMES_HOME/.env"
 fi
+if [[ -L /home/hermes/vault || -L /home/hermes/vault/business ]]; then
+  echo 'Business Brief vault path must not contain a link.' >&2
+  exit 1
+fi
 install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" /home/hermes/vault
+install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" /home/hermes/vault/business
+if [[ -L /home/hermes/vault/business/BRIEF.md ]]; then
+  echo 'Business Brief path must not be a link.' >&2
+  exit 1
+fi
+if [[ ! -e /home/hermes/vault/business/BRIEF.md ]]; then
+  install -m 0600 -o "$HERMES_USER" -g "$HERMES_USER" "$KIT_DIR/profile/templates/BUSINESS-BRIEF.md" /home/hermes/vault/business/BRIEF.md
+fi
+chown "$HERMES_USER:$HERMES_USER" /home/hermes/vault/business/BRIEF.md
+chmod 0600 /home/hermes/vault/business/BRIEF.md
+# Office helpers are preprovisioned once in a kit-owned environment. Client chat
+# never gains general terminal execution from these skills.
+if [[ ! -x /opt/hermes-kit/office-venv/bin/python ]]; then
+  python3 -m venv /opt/hermes-kit/office-venv
+fi
+if ! /opt/hermes-kit/office-venv/bin/python - "$KIT_DIR/lib/office-requirements.txt" <<'PYREQ'
+from importlib.metadata import version, PackageNotFoundError
+from pathlib import Path
+import sys
+for line in Path(sys.argv[1]).read_text().splitlines():
+    package, wanted = line.split('==')
+    try:
+        assert version(package) == wanted
+    except (PackageNotFoundError, AssertionError):
+        sys.exit(1)
+PYREQ
+then
+  /opt/hermes-kit/office-venv/bin/pip install --no-cache-dir -r "$KIT_DIR/lib/office-requirements.txt"
+fi

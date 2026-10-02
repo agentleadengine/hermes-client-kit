@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Install a client Business Brief and consent-gated Hermes USER.md summary."""
+from __future__ import annotations
+import argparse
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import sys
+import tempfile
+
+BRIEF = Path(os.environ.get('KIT_BRIEF_PATH', '/home/hermes/vault/business/BRIEF.md'))
+USER = Path(os.environ.get('KIT_BRIEF_USER_PATH', '/home/hermes/.hermes/profiles/client/memories/USER.md'))
+LEDGER = Path(os.environ.get('KIT_CONSENT_LEDGER', '/etc/hermes-kit/consents.json'))
+MAX_BRIEF = 65536
+MAX_USER = 1375  # pinned Hermes default user_char_limit
+START = 'Business Brief summary:'
+END = 'End Business Brief summary.'
+SECRET = re.compile(r'(?i)(?:\b(?:password|passwd|api[_ -]?key|secret|access[_ -]?token|private[_ -]?key|recovery[_ -]?code)\b\s*(?::|=|is)\s*\S+|\b(?:sk|ghp|gho|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}\b|\bAKIA[0-9A-Z]{16}\b)')
+
+
+def fail(message: str) -> None:
+    raise ValueError(message)
+
+
+def owner() -> tuple[int, int]:
+    if os.environ.get('KIT_BRIEF_TEST_MODE') == '1':
+        return os.getuid(), os.getgid()
+    if os.geteuid() != 0:
+        fail('kit-brief must run as root during setup')
+    user = pwd.getpwnam('hermes')
+    return user.pw_uid, user.pw_gid
+
+
+def card_number(text: str) -> bool:
+    for match in re.finditer(r'(?<!\d)(?:\d[ -]?){13,19}(?!\d)', text):
+        digits = re.sub(r'\D', '', match.group())
+        if 13 <= len(digits) <= 19:
+            nums = [int(x) for x in digits[::-1]]
+            if sum(n if i % 2 == 0 else (n * 2 - 9 if n * 2 > 9 else n * 2) for i, n in enumerate(nums)) % 10 == 0:
+                return True
+    return False
+
+
+def checked_text(raw: bytes) -> str:
+    if not raw or len(raw) > MAX_BRIEF:
+        fail('Brief must be 1–65536 bytes')
+    try:
+        content = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        fail('Brief must be UTF-8 plain text')
+    if '\x00' in content or any(ord(c) < 32 and c not in '\n\r\t' for c in content):
+        fail('Brief must be plain text')
+    if SECRET.search(content) or card_number(content):
+        fail('Brief contains a possible secret or card number; remove it before installing')
+    if re.search(r'\[[^\]\n]{2,80}\]', content):
+        fail('Fill the bracketed placeholders before installing the brief')
+    for field in ('Name:', 'Address me as:', 'Trade:', 'Service area:', 'Sound like:', 'Real example 1:', 'Real example 2:', 'Real example 3:'):
+        if not re.search(r'(?m)^-?\s*' + re.escape(field) + r'\s*\S+', content):
+            fail(f'Brief needs {field}')
+    return content
+
+
+def safe_target(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        fail('Target must be a regular file, not a link')
+    if any(parent.is_symlink() for parent in path.parents):
+        fail('Target path must not contain a linked directory')
+
+
+def write_private(path: Path, text: str, uid: int, gid: int) -> None:
+    safe_target(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.environ.get('KIT_BRIEF_TEST_MODE') != '1':
+        os.chown(path.parent, uid, gid)
+        os.chmod(path.parent, 0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix='.brief-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chown(temporary, uid, gid)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def value(content: str, label: str) -> str:
+    match = re.search(r'(?m)^-\s*' + re.escape(label) + r'\s*(.+?)\s*$', content)
+    return match.group(1).strip() if match else ''
+
+
+def summary(content: str) -> str:
+    prefs = [value(content, x) for x in ('Discounts:', 'Promises:', 'Other words or topics:')]
+    fields = [('Owner', value(content, 'Name:')), ('Business', value(content, 'Name:')), ('Trade', value(content, 'Trade:')), ('Area', value(content, 'Service area:')), ('Tone', value(content, 'Sound like:'))]
+    business = re.search(r'(?ms)^## Business\s+.*?^- Name:\s*(.+?)\s*$', content)
+    if business:
+        fields[1] = ('Business', business.group(1))
+    lines = [START] + [f'{key}: {val}' for key, val in fields]
+    lines += [f'Preference {i}: {pref}' for i, pref in enumerate(prefs, 1) if pref]
+    lines += ['Full details: /home/hermes/vault/business/BRIEF.md', END]
+    result = '\n'.join(lines)
+    if len(result) > 650:
+        fail('Brief summary is too long; shorten the tone and three preferences')
+    return result
+
+
+def consented(consent_id: str) -> bool:
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,80}', consent_id):
+        fail('Use a simple recorded consent ID')
+    if not LEDGER.is_file():
+        return False
+    data = json.loads(LEDGER.read_text())
+    return any(e.get('integration') == 'brief-memory' and e.get('consent_id') == consent_id for e in data.get('consents', []))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='action', required=True)
+    setting = commands.add_parser('set'); setting.add_argument('--from', dest='source', required=True, type=Path)
+    commands.add_parser('show')
+    seeding = commands.add_parser('seed-memory'); seeding.add_argument('--consent-id', required=True)
+    args = parser.parse_args()
+    uid, gid = owner()
+    safe_target(BRIEF)
+    if args.action == 'set':
+        source = args.source
+        if source.is_symlink() or not source.is_file():
+            fail('Source must be a regular plain-text file')
+        content = checked_text(source.read_bytes())
+        write_private(BRIEF, content.rstrip() + '\n', uid, gid)
+        print('Business Brief installed.')
+    elif args.action == 'show':
+        if not BRIEF.is_file(): fail('Business Brief is missing')
+        sys.stdout.write(BRIEF.read_text(encoding='utf-8'))
+    else:
+        if not consented(args.consent_id): fail('Matching recorded brief-memory consent ID is required')
+        if not BRIEF.is_file(): fail('Business Brief is missing')
+        content = checked_text(BRIEF.read_bytes())
+        entry = summary(content)
+        safe_target(USER)
+        existing = USER.read_text(encoding='utf-8') if USER.exists() else ''
+        existing = re.sub(r'(?ms)^Business Brief summary:\n.*?^End Business Brief summary\.\n?', '', existing).strip()
+        result = ('\n§\n'.join(part for part in (existing, entry) if part) + '\n')
+        if len(result) > MAX_USER: fail('USER.md is at its 1375-character limit; review its existing entries first')
+        write_private(USER, result, uid, gid)
+        print('Short Business Brief summary saved to client USER.md.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f'kit-brief: {exc}', file=sys.stderr)
+        sys.exit(1)

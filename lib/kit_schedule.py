@@ -17,6 +17,8 @@ def main():
     parser.add_argument("schedule")
     parser.add_argument("prompt")
     parser.add_argument("--name", required=True)
+    parser.add_argument("--deliver", default="local")
+    parser.add_argument("--paused", action="store_true")
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise ValueError("Run as root with the client present")
@@ -30,7 +32,12 @@ def main():
     path = HOME / "cron" / "jobs.json"
     before = json.loads(path.read_text()) if path.exists() else []
     before = before if isinstance(before, list) else before.get("jobs", [])
-    created = subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "create", args.schedule, args.prompt, "--name", args.name, "--deliver", "local", "--paused"], capture_output=True, text=True, check=False)
+    if len(before) >= 20:
+        raise ValueError("Limit of 20 cron jobs reached")
+    from kit_reminders import audit_prompt, owner_target, valid_schedule
+    if args.deliver not in {"local", owner_target()} or not args.deliver or not valid_schedule(args.schedule, new=True):
+        raise ValueError("Schedule must be at least 15 minutes away and deliver only to the owner or local")
+    created = subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "create", args.schedule, args.prompt, "--name", args.name, "--deliver", args.deliver, "--paused"], capture_output=True, text=True, check=False)
     print(created.stdout, end="")
     print(created.stderr, end="", file=sys.stderr)
     after = json.loads(path.read_text())
@@ -53,9 +60,11 @@ def main():
         os.fchown(handle.fileno(), stat.st_uid, stat.st_gid)
     temporary.replace(path)
     validate_cron_jobs()
-    resumed = subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "resume", new_ids[0]], capture_output=True, text=True, check=False)
-    if resumed.returncode:
-        raise subprocess.CalledProcessError(resumed.returncode, resumed.args, resumed.stdout, resumed.stderr)
+    audit_prompt(args.prompt, args.schedule)
+    if not args.paused:
+        resumed = subprocess.run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "resume", new_ids[0]], capture_output=True, text=True, check=False)
+        if resumed.returncode:
+            raise subprocess.CalledProcessError(resumed.returncode, resumed.args, resumed.stdout, resumed.stderr)
     ids_path = ETC / "schedules-ids.json"
     ids = json.loads(ids_path.read_text()) if ids_path.exists() else []
     ids.extend(new_ids)

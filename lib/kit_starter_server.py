@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import shutil
 import socket
 import socketserver
 import struct
@@ -15,6 +16,42 @@ import kit_tools
 SOCKET = Path("/run/hermes-kit/starter.sock")
 SOURCE = Path("/home/hermes/vault/tools")
 CONSENTS = Path("/etc/hermes-kit/consents.json")
+VAULT = Path("/home/hermes/vault")
+PREVIEWS = VAULT / "media/tool-previews"
+
+
+def staged_previews(name: str, commit: str) -> dict[str, str]:
+    """Copy only small PNG test artifacts out of the isolated Builder checkout."""
+    staged = kit_tools.ROOT / "staging" / name / commit
+    artifacts = staged / "tests" / "artifacts"
+    if not artifacts.is_dir() or artifacts.is_symlink() or not artifacts.resolve().is_relative_to(staged.resolve()):
+        return {}
+    destination = PREVIEWS / name / commit
+    vault = VAULT.resolve()
+    for parent in (PREVIEWS.parent, PREVIEWS, PREVIEWS / name, destination):
+        if parent.is_symlink() or not parent.resolve().is_relative_to(vault):
+            raise ValueError("Unsafe preview destination")
+        parent.mkdir(mode=0o700, exist_ok=True)
+        os.chown(parent, pwd.getpwnam("hermes").pw_uid, pwd.getpwnam("hermes").pw_gid)
+    result = {}
+    for label in ("phone", "desktop"):
+        source = artifacts / f"{label}.png"
+        if not source.is_file() or source.is_symlink() or not source.resolve().is_relative_to(staged.resolve()):
+            continue
+        if source.stat().st_size > 5_000_000 or source.stat().st_size < 24:
+            raise ValueError("Preview image size is invalid")
+        with source.open("rb") as image:
+            signature = image.read(8)
+        if signature != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("Preview image is not a PNG")
+        target = destination / source.name
+        if target.is_symlink():
+            raise ValueError("Unsafe preview file")
+        shutil.copyfile(source, target)
+        os.chown(target, pwd.getpwnam("hermes").pw_uid, pwd.getpwnam("hermes").pw_gid)
+        target.chmod(0o600)
+        result[label] = str(target)
+    return result
 
 
 def consent(name):
@@ -34,7 +71,7 @@ def dispatch(request):
             raise ValueError("Tool source must be inside the client's vault tools area")
         kit_tools.stage(name, source=str(source), commit=request.get("commit"))
         item = kit_tools.entry(kit_tools.registry(), name)
-        return {"staged": item["staged"], "port": item["port"]}
+        return {"staged": item["staged"], "port": item["port"], "previews": staged_previews(name, item["staged"])}
     if action == "publish":
         if not consent("tailscale"):
             raise ValueError("Tailscale consent is required for private tool publication")

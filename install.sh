@@ -79,6 +79,8 @@ load_kit_config "$CONFIG_FILE"
 : "${HINDSIGHT_LLM_MODEL:=}"
 : "${HINDSIGHT_LLM_BASE_URL:=}"
 : "${KIT_TIER:=care}"
+: "${KIT_SEGMENT:=other}"
+: "${KIT_PACKS:=}"
 : "${SUPPORT_PLATFORM:=none}"
 : "${SUPPORT_ALLOWED_USER:=}"
 : "${OTLP_HEALTH_ENDPOINT:=}"
@@ -86,6 +88,7 @@ load_kit_config "$CONFIG_FILE"
  : "${AGENT_CARE_JOB_ID:=}"
  : "${AGENT_CARE_JOB_TOKEN:=}"
 validate_no_allow_all_config || { echo 'Allow-all messaging flags are forbidden.' >&2; exit 1; }
+python3 "$KIT_DIR/lib/kit_packs.py" validate-config "$KIT_DIR/profile" "$KIT_SEGMENT" "$KIT_PACKS"
 if [[ $MESSAGING_PLATFORM == agentmail ]]; then
   validate_explicit_allowlist "$MAIL_ALLOWED_SENDERS" || { echo 'MAIL_ALLOWED_SENDERS must be an explicit non-wildcard list.' >&2; exit 1; }
   validate_explicit_allowlist "$MAIL_ALLOWED_RECIPIENTS" || { echo 'MAIL_ALLOWED_RECIPIENTS must be an explicit non-wildcard list.' >&2; exit 1; }

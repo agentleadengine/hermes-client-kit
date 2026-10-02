@@ -6,6 +6,10 @@ Starter by AtlasOmnia. Donna Starter is licensed under the MIT License.
 It also adapts the two-layer tool policy concept from hermes-starter-profile
 by Teknium. hermes-starter-profile is licensed under the MIT License.
 
+The profile vendors frontend-design and webapp-testing from anthropics/skills
+under Apache-2.0, and ui-ux-pro-max from nextlevelbuilder/ui-ux-pro-max-skill
+under MIT. Their license files and exact upstream commits are in skills/design/.
+
 MIT License
 
 Copyright (c) AtlasOmnia

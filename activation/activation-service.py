@@ -77,7 +77,25 @@ def chat_section(token, route, nonce):
         if re.fullmatch(r"\+[1-9]\d{6,14}", line):
             section += '<p>Text your assistant at <strong>' + html.escape(line) + '</strong> from your iPhone.</p>'
     section += f'<h3>Telegram</h3><p>Create a bot with <a href="https://t.me/BotFather" rel="noreferrer">@BotFather</a>. Open your bot and tap Start before connecting. Get your numeric ID from <a href="https://t.me/userinfobot" rel="noreferrer">@userinfobot</a>.</p><form method="post" action="{action}">{hidden}<input type="hidden" name="platform" value="telegram"><p><label>Bot token <input name="bot_token" type="password" autocomplete="off" required size="50"></label></p><p><label>Your numeric Telegram user ID <input name="telegram_user_id" inputmode="numeric" pattern="[0-9]{{5,15}}" required></label></p><button>Connect Telegram</button></form>'
-    section += f'<h3>iMessage via Photon</h3><p>Find your Spectrum project ID and project secret in your <a href="https://app.photon.codes/" rel="noreferrer">Photon dashboard</a>.</p><form method="post" action="{action}">{hidden}<input type="hidden" name="platform" value="photon"><p><label>Photon project ID <input name="project_id" autocomplete="off" required></label></p><p><label>Photon project secret <input name="project_secret" type="password" autocomplete="off" required size="50"></label></p><p><label>Your iMessage phone (international +country code and number) <input name="phone" type="tel" autocomplete="off" placeholder="+15551234567" required></label></p><button>Connect iMessage</button></form>'
+    section += f'<h3>Connect iMessage</h3><p>Enter your iPhone number. Photon will ask you to approve this device in your own account.</p><form method="post" action="{action}">{hidden}<input type="hidden" name="platform" value="photon"><input type="hidden" name="mode" value="device-login"><p><label>Your iMessage phone (international +country code and number) <input name="phone" type="tel" autocomplete="off" placeholder="+15551234567" required></label></p><button>Connect iMessage</button></form>'
+    try:
+        state = json.loads(read(Path("/var/lib/hermes-kit/photon-device.json"), "{}"))
+    except ValueError:
+        state = {}
+    if state.get("status") == "waiting":
+        url = state.get("url", "")
+        code = state.get("code", "")
+        section += '<p>Open this on your phone and tap Approve.'
+        if isinstance(url, str) and re.fullmatch(r"https://app\.photon\.codes/[A-Za-z0-9/?&=_%-]{0,500}", url):
+            section += ' <a href="' + html.escape(url, quote=True) + '" rel="noreferrer">Open Photon approval</a>'
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9-]{4,20}", code):
+            section += ' Enter code <strong>' + html.escape(code) + '</strong> if asked.'
+        section += '</p><p>Refresh this page after approval to see the result.</p>'
+    elif state.get("status") == "connected":
+        section += '<p>' + chat_message_html(str(state.get("message", "Connected."))) + '</p>'
+    elif state.get("status") == "failed":
+        section += '<p>Photon setup did not complete. Try again or ask your setup guide.</p>'
+    section += f'<details><summary>Manual project setup</summary><p>Use this only if device approval is unavailable. Find the Spectrum project ID and secret in your Photon dashboard.</p><form method="post" action="{action}">{hidden}<input type="hidden" name="platform" value="photon"><input type="hidden" name="mode" value="manual"><p><label>Photon project ID <input name="project_id" autocomplete="off" required></label></p><p><label>Photon project secret <input name="project_secret" type="password" autocomplete="off" required size="50"></label></p><p><label>Your iMessage phone <input name="phone" type="tel" placeholder="+15551234567" required></label></p><button>Connect manually</button></form></details>'
     section += f'<form method="post" action="/{route}/{token}/chat-skip">{hidden}<button>Skip for now</button></form>'
     if route == "home" and current != "none":
         section += f'<form method="post" action="/home/{token}/chat-disconnect">{hidden}<button>Disconnect chat app</button></form>'
@@ -91,7 +109,7 @@ def chat_result(fields, route):
     if platform == "telegram":
         data.update(bot_token=fields.get("bot_token", [""])[0], telegram_user_id=fields.get("telegram_user_id", [""])[0])
     elif platform == "photon":
-        data.update(project_id=fields.get("project_id", [""])[0], project_secret=fields.get("project_secret", [""])[0], phone=fields.get("phone", [""])[0])
+        data.update(mode=fields.get("mode", ["device-login"])[0], project_id=fields.get("project_id", [""])[0], project_secret=fields.get("project_secret", [""])[0], phone=fields.get("phone", [""])[0])
     try:
         result = subprocess.run(["/usr/local/bin/kit-chat-connect"], input=json.dumps(data), text=True,
                                 capture_output=True, timeout=240, check=False)
@@ -196,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "HermesKitActivation"
     def log_message(self, *_): pass
     def send_html(self, code, title, body):
-        payload = page(title, body); self.send_response(code); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+        payload = page(title, body); self.send_response(code); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self'; form-action 'self'; base-uri 'none'"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
     def token(self, directory, prefix):
         path = urlparse(self.path).path
         match = re.fullmatch(prefix + r"/([A-Fa-f0-9]{64})(?:/.*)?", path)
@@ -208,9 +226,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         token = self.token(STATE, "/activate")
         if token:
+            if self.path.endswith("/chatgpt-device-code.jpg"):
+                payload = (Path(__file__).parent / "chatgpt-device-code.jpg").read_bytes()
+                self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+                return
             log = html.escape(read(STATE / "codex-device.log")[-4000:])
             setup_button = finish_setup_form(token, "activate") if setup_until() else ""
-            self.send_html(200, "Activate your private Hermes agent", enrollment_notice() + f"<p>Sign in with your own ChatGPT account. This page never displays agent data.</p><form method=post action='/activate/{token}/codex'><button>Show ChatGPT device code</button></form><pre>{log}</pre>" + chat_section(token, "activate", new_chat_nonce(token)) + f"{setup_button}<form method=post action='/activate/{token}/complete'><button>Finish activation and close this page</button></form>")
+            self.send_html(200, "Activate your private Hermes agent", enrollment_notice() + f"<section><h2>First, turn this on in ChatGPT</h2><p>Settings &gt; Security and login &gt; Enable device code sign-in for Codex, Excel, PowerPoint, and Word</p><img src='/activate/{token}/chatgpt-device-code.jpg' alt='ChatGPT Security and login setting for device code sign-in' style='max-width:100%;height:auto'></section><section><h2>Sign in</h2><p>Sign in with your own ChatGPT account. This page never displays agent data.</p><form method=post action='/activate/{token}/codex'><button>Show ChatGPT device code</button></form><pre>{log}</pre></section>" + chat_section(token, "activate", new_chat_nonce(token)) + f"{setup_button}<form method=post action='/activate/{token}/complete'><button>Finish activation and close this page</button></form>")
             return
         token = self.token(SUPPORT, "/support")
         if token:

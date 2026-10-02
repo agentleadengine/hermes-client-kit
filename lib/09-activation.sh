@@ -7,6 +7,7 @@ ln -sfn "$KIT_RUNTIME_DIR/bin/kit-activation" /usr/local/bin/kit-activation
 ln -sfn "$KIT_RUNTIME_DIR/activation/chat-connect.py" /usr/local/bin/kit-chat-connect
 ln -sfn "$KIT_RUNTIME_DIR/bin/kit-install-report" /usr/local/bin/kit-install-report
 install -m 0755 "$KIT_DIR/activation/activation-service.py" /usr/local/lib/hermes-kit-activation-service.py
+install -m 0644 "$KIT_DIR/activation/chatgpt-device-code.jpg" /usr/local/lib/chatgpt-device-code.jpg
 install -m 0644 "$KIT_DIR/activation/Caddyfile" /etc/caddy/Caddyfile
 install -m 0644 /dev/stdin /etc/systemd/system/hermes-kit-activation.service <<'EOF'
 [Unit]

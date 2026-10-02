@@ -24,6 +24,8 @@ POWERUPS = {"base", "builder", "website", "netlify", "tailscale", "media", "sche
 BASE_DISABLED = ["terminal", "code_execution", "browser", "computer_use", "delegation", "kanban", "cronjob", "image_gen", "tts", "homeassistant", "messaging"]
 BASE_TOOLS = ["clarify", "file", "memory", "search", "skills", "todo", "vision", "web"]
 BLOCKED = hermes_blocklist()
+QA_PYTHON = Path("/opt/hermes-kit/qa-venv/bin/python")
+QA_PLAYWRIGHT_VERSION = "1.55.0"
 
 
 def run(args: list[str]):
@@ -45,6 +47,19 @@ def local_chromium() -> str:
     if not browser:
         raise ValueError("Local Chromium is required for Logins")
     return browser
+
+
+def install_builder_qa():
+    """Use the kit's Chromium; install only Playwright's Python driver."""
+    local_chromium()
+    if not QA_PYTHON.exists():
+        run(["python3", "-m", "venv", "--system-site-packages", str(QA_PYTHON.parent.parent)])
+    result = subprocess.run(
+        [str(QA_PYTHON), "-c", "from importlib.metadata import version; print(version('playwright'))"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or result.stdout.strip() != QA_PLAYWRIGHT_VERSION:
+        run([str(QA_PYTHON.parent / "pip"), "install", "--no-cache-dir", f"playwright=={QA_PLAYWRIGHT_VERSION}"])
 
 
 def config_set(key: str, value):
@@ -111,6 +126,8 @@ def on(name: str, waiver: str | None, client: str, confirmation: str = "client-o
     try:
         if name in {"builder", "website", "media"}:
             install_starter()
+        if name in {"builder", "website"} and os.environ.get("KIT_POWERUP_TEST_MODE") != "1":
+            install_builder_qa()
         apply_policy({x.get("integration") for x in data["consents"]}, data["consents"])
         if name == "builder":
             run([str(KIT / "bin" / "kit-tools-setup")])
@@ -123,6 +140,8 @@ def on(name: str, waiver: str | None, client: str, confirmation: str = "client-o
             config_path.write_bytes(old_config)
         raise
     save(data)
+    if name == "schedules":
+        seed_schedule_jobs()
     if name in {"builder", "website", "media"} and os.environ.get("KIT_POWERUP_TEST_MODE") != "1" and not any(x.get("integration") == "plugin:kit-starter" for x in data["consents"]):
         data["consents"].append(dict(entry, integration="plugin:kit-starter"))
         save(data)
@@ -146,9 +165,12 @@ def off(name: str):
     if name == "website" and any(x.get("integration") == "netlify" for x in data["consents"]):
         raise ValueError("Disable Netlify before Website")
     if name == "schedules" and os.environ.get("KIT_POWERUP_TEST_MODE") != "1":
-        schedule_ids = ETC / "schedules-ids.json"
-        for job_id in json.loads(schedule_ids.read_text()) if schedule_ids.exists() else []:
-            run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "pause", job_id])
+        job_path = HOME / "cron" / "jobs.json"
+        document = json.loads(job_path.read_text()) if job_path.exists() else []
+        jobs = document if isinstance(document, list) else document.get("jobs", [])
+        for job in jobs:
+            if job.get("enabled") is not False:
+                run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "cron", "pause", str(job["id"])])
     removed = {name, "plugin:kit-logins" if name == "logins" else ""}
     if name in {"builder", "website", "media"} and not ({x.get("integration") for x in data["consents"]} - {name} & {"builder", "website", "media"}):
         removed.add("plugin:kit-starter")
@@ -198,16 +220,23 @@ def apply_policy(enabled: set[str], entries: list[dict] | None = None):
     allowed = grants(entries if entries is not None else consents().get("consents", []))
     active_mcp = configured_mcp_servers() if any(allowed.values()) else set()
     reachable_grants = {platform: servers & active_mcp for platform, servers in allowed.items()}
-    disabled = [x for x in BASE_DISABLED if not (x == "browser" and "logins" in enabled)]
+    disabled = [x for x in BASE_DISABLED if not ((x == "browser" and "logins" in enabled) or (x == "cronjob" and "schedules" in enabled))]
     config_set("agent.disabled_toolsets", disabled)
     tools = BASE_TOOLS + (["browser"] if "logins" in enabled else [])
+    from kit_reminders import owner_target
+    selected_chat = owner_target().split(":", 1)[0] if "schedules" in enabled else ""
     for platform in PLATFORMS:
-        native = tools if platform in BASE_PLATFORMS and platform != "cron" else ([] if platform not in BASE_PLATFORMS else BASE_TOOLS)
+        native = (tools + (["cronjob"] if platform == selected_chat else [])) if platform in BASE_PLATFORMS and platform != "cron" else ([] if platform not in BASE_PLATFORMS else BASE_TOOLS)
         config_set(f"platform_toolsets.{platform}", platform_tools(platform, native, reachable_grants))
     # Cron is never given browser or mutation tools. Hermes docs: per-job
     # enabled_toolsets can override platform_toolsets.cron, so validate jobs.
     seal_cron_overrides()
-    plugins = [name for name in enabled_plugins() if name not in {"kit-logins", "kit-starter"}]
+    plugins = [name for name in enabled_plugins() if name not in {"kit-logins", "kit-starter", "kit-reminders", "kit-welcome"}]
+    install_welcome()
+    plugins.append("kit-welcome")
+    if "schedules" in enabled:
+        install_reminder_guard()
+        plugins.append("kit-reminders")
     if "logins" in enabled:
         plugins.append("kit-logins")
     if enabled & {"builder", "website", "media"}:
@@ -225,18 +254,100 @@ def validate_cron_jobs():
     path = HOME / "cron" / "jobs.json"
     jobs = json.loads(path.read_text()) if path.exists() else []
     jobs = jobs if isinstance(jobs, list) else jobs.get("jobs", [])
+    if not isinstance(jobs, list) or len(jobs) > 20:
+        raise ValueError("At most 20 cron jobs are allowed")
     for job in jobs:
-        if job.get("enabled") is False:
-            continue
+        if not isinstance(job, dict):
+            raise ValueError("Invalid cron job")
         configured_tools = job.get("enabled_toolsets")
         if configured_tools is not None and not isinstance(configured_tools, list):
             raise ValueError("Cron job toolset must be a list or null")
         tools = set(BASE_TOOLS if configured_tools is None else configured_tools)
+        from kit_reminders import allowed_delivery, owner_target, valid_schedule
         if (tools - (set(BASE_TOOLS) | {"no_mcp"}) or
                 (configured_tools and "no_mcp" not in tools) or
-                job.get("deliver", "local") != "local" or job.get("script") or
-                job.get("monitor_script") or job.get("no_agent")):
-            raise ValueError("Cron job has a non-read/draft toolset")
+                not allowed_delivery(job.get("deliver", "local"), owner_target(), job.get("origin")) or
+                (job.get("failure_deliver") not in {None, ""} and
+                 not allowed_delivery(job.get("failure_deliver"), owner_target(), job.get("origin"))) or
+                job.get("script") or job.get("monitor_script") or job.get("monitor_url") or
+                job.get("no_agent") or job.get("workdir") or not valid_schedule(job.get("schedule"))):
+            raise ValueError("Cron job violates owner-only reminder policy")
+        if not isinstance(job.get("prompt"), str) or not job["prompt"].strip():
+            raise ValueError("Cron job needs an auditable prompt")
+        if job.get("enabled") is not False and "schedules" not in {x.get("integration") for x in consents().get("consents", [])}:
+            raise ValueError("Active cron job needs Schedules consent")
+
+
+def seed_schedule_jobs():
+    """Create two paused examples after Schedules consent and owner chat setup."""
+    if os.environ.get("KIT_POWERUP_TEST_MODE") == "1":
+        return
+    from kit_reminders import audit_prompt, owner_target
+    target = owner_target()
+    if not target:
+        return
+    path = HOME / "cron" / "jobs.json"
+    document = json.loads(path.read_text()) if path.exists() else []
+    jobs = document if isinstance(document, list) else document.get("jobs", [])
+    examples = (
+        ("Monday plan", "every monday 9am", "Use weekly-review-planning and the Business Brief to send me a concise Monday plan: priorities, follow-ups, and one decision to make."),
+        ("Friday wrap", "every friday 4pm", "Use the Business Brief and notes in the vault to send me a concise Friday wrap: completed work, loose ends, and the first priority for Monday."),
+    )
+    missing = sum(not any(job.get("name") == name for job in jobs) for name, _, _ in examples)
+    if len(jobs) + missing > 20:
+        raise ValueError("Cannot seed reminders: 20 cron jobs already exist")
+    for name, schedule, prompt in examples:
+        if any(job.get("name") == name for job in jobs):
+            continue
+        args = ["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN,
+                "-p", "client", "cron", "create", schedule, prompt, "--name", name, "--deliver", target, "--paused"]
+        if name == "Monday plan":
+            args.extend(["--skill", "weekly-review-planning"])
+        before_ids = {str(job.get("id")) for job in jobs}
+        created = subprocess.run(args, check=False, capture_output=True, text=True)
+        if not path.exists():
+            raise ValueError("Hermes did not write the seeded reminder")
+        document = json.loads(path.read_text())
+        jobs = document if isinstance(document, list) else document.get("jobs", [])
+        new_jobs = [job for job in jobs if str(job.get("id")) not in before_ids]
+        if len(new_jobs) != 1 or new_jobs[0].get("name") != name:
+            raise subprocess.CalledProcessError(created.returncode or 1, args, created.stdout, created.stderr)
+        audit_prompt(prompt, schedule)
+    validate_cron_jobs()
+
+
+def install_reminder_guard():
+    if os.environ.get("KIT_POWERUP_TEST_MODE") == "1":
+        return
+    source = KIT / "plugins" / "kit-reminders"
+    target = HOME / "plugins" / "kit-reminders"
+    marker = ETC / "kit-reminders.installed"
+    if target.exists() and not marker.exists():
+        raise ValueError("Existing reminders plugin is not kit-owned")
+    target.mkdir(parents=True, exist_ok=True)
+    marker.write_text("kit-reminders\n")
+    for filename in ("__init__.py", "plugin.yaml"):
+        shutil.copy2(source / filename, target / filename)
+    shutil.copy2(KIT / "lib" / "kit_reminders.py", target / "kit_reminders.py")
+    run(["chown", "-R", "root:root", str(target)])
+
+
+def install_welcome():
+    if os.environ.get("KIT_POWERUP_TEST_MODE") == "1":
+        return
+    source = KIT / "plugins" / "kit-welcome"
+    target = HOME / "plugins" / "kit-welcome"
+    marker = ETC / "kit-welcome.installed"
+    if target.exists() and not marker.exists():
+        raise ValueError("Existing welcome plugin is not kit-owned")
+    target.mkdir(parents=True, exist_ok=True)
+    marker.write_text("kit-welcome\n")
+    for filename in ("__init__.py", "plugin.yaml"):
+        shutil.copy2(source / filename, target / filename)
+    shutil.copy2(KIT / "lib" / "kit_welcome.py", target / "kit_welcome.py")
+    shutil.copy2(KIT / "lib" / "kit_reminders.py", target / "kit_reminders.py")
+    shutil.copy2(KIT / "lib" / "kit_quota_notice.py", target / "kit_quota_notice.py")
+    run(["chown", "-R", "root:root", str(target)])
 
 
 def seal_cron_overrides():
@@ -398,14 +509,14 @@ def install_starter():
     if target.exists():
         if not (ETC / "kit-starter.installed").exists():
             raise ValueError("Existing starter plugin is not kit-owned")
-        extras = {item.name for item in target.iterdir()} - {"__init__.py", "plugin.yaml", "kit_website.py", "kit_video.py", "__pycache__"}
+        extras = {item.name for item in target.iterdir()} - {"__init__.py", "plugin.yaml", "kit_website.py", "kit_video.py", "kit_site_check.py", "__pycache__"}
         if extras:
             raise ValueError("Unexpected files in starter plugin")
     else:
         target.mkdir(parents=True)
     for filename in ("__init__.py", "plugin.yaml"):
         shutil.copy2(source / filename, target / filename)
-    for filename in ("kit_website.py", "kit_video.py"):
+    for filename in ("kit_website.py", "kit_video.py", "kit_site_check.py"):
         shutil.copy2(KIT / "lib" / filename, target / filename)
     (ETC / "kit-starter.installed").write_text("kit-starter\n")
     run(["chown", "-R", "root:root", str(target)])

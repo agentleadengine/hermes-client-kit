@@ -1,0 +1,82 @@
+{
+  "version": "2026-10-02",
+  "source": "Merged from research/profile-packs (Kimi K3, Astra, Fable). Single source of truth for the intake picker, the kit (KIT_PACKS) and the CRM.",
+  "approval_line": "Your assistant drafts. You approve before anything is sent, posted, shared, bought or published. We never read your email inbox.",
+  "change_line": "Change your picks any time by texting your assistant.",
+  "included": {
+    "id": "base",
+    "name": "Included with every plan",
+    "items": ["Your prices, answers and the way you write", "Research with sources", "Notes, memory and a Monday plan"],
+    "skills": ["business/business-brief", "business/reminders", "research/source-verification", "research/evidence-based-replies", "research/local-discovery", "research/grounded-citations", "note-taking/obsidian", "note-taking/vault-organization", "productivity/weekly-review-planning", "writing/humanizer"]
+  },
+  "segments": [
+    {"id": "trades", "name": "Home services and trades", "hint": "Plumbing, HVAC, cleaning, roofing, landscaping", "defaults": ["front-desk", "get-paid", "reviews"]},
+    {"id": "insurance", "name": "Insurance", "hint": "Independent agents and small agencies", "defaults": ["front-desk", "paperwork", "reviews"]},
+    {"id": "real-estate", "name": "Real estate", "hint": "Agents, teams and small brokerages", "defaults": ["front-desk", "marketing", "paperwork"]},
+    {"id": "office", "name": "Office or professional services", "hint": "Accounting, consulting, clinics' front office, small firms", "defaults": ["paperwork", "front-desk", "dashboards"]},
+    {"id": "other", "name": "Something else", "hint": "We will suggest a starting set", "defaults": ["front-desk", "paperwork"]}
+  ],
+  "packs": [
+    {
+      "id": "front-desk",
+      "name": "Front Desk",
+      "promise": "Fast, friendly replies and follow-ups in your voice, so no lead or quote goes cold.",
+      "examples": ["Reply to this text from Mrs. Diaz about the leak", "Follow up on the Hendersons' quote from Tuesday", "Confirm tomorrow's 9am with a friendly reminder"],
+      "segment_extras": {"insurance": "Renewal check-ins and certificate request replies", "real-estate": "Showing and open-house follow-ups"},
+      "skills": ["business/first-response", "business/quote-follow-up", "creative/content-style"],
+      "new_skills": ["first-response", "quote-follow-up"],
+      "approvals": "Drafts only. You send. No coverage promises or fair-housing risks in drafts.",
+      "setup_minutes": 60
+    },
+    {
+      "id": "get-paid",
+      "name": "Get Paid",
+      "promise": "Quotes, job write-ups and polite payment reminders, ready for you to send.",
+      "examples": ["Turn these notes into a quote", "Write up today's job at 14 Oak St", "Draft a polite reminder for invoice 203, 10 days late"],
+      "skills": ["business/job-write-up", "business/invoice-reminder-drafts", "office/docx", "office/xlsx", "office/pdf"],
+      "new_skills": ["job-write-up", "invoice-reminder-drafts"],
+      "approvals": "No access to your bank or payment apps. Amounts come from you.",
+      "setup_minutes": 60
+    },
+    {
+      "id": "reviews",
+      "name": "Reviews and Google",
+      "promise": "Answer every review and keep your Google listing fresh.",
+      "examples": ["Reply to this 3-star review", "Write a Google post about our fall tune-up special", "Text asking Mr. Lee for a review"],
+      "skills": ["business/review-reply", "business/gbp-post-draft"],
+      "new_skills": ["review-reply", "gbp-post-draft"],
+      "approvals": "You paste and post. Nothing is posted for you.",
+      "setup_minutes": 45
+    },
+    {
+      "id": "paperwork",
+      "name": "Paperwork Desk",
+      "promise": "Turns documents, meetings and receipts into clear summaries, files and to-do lists.",
+      "examples": ["What does this contract make me do and by when?", "Build a spreadsheet from these receipts", "Turn my meeting notes into a to-do list with dates"],
+      "skills": ["office/docx", "office/xlsx", "office/pdf", "office/powerpoint", "business/document-to-action-items", "business/meeting-action-items", "productivity/office-document-review"],
+      "new_skills": [],
+      "approvals": "Summaries are not legal advice and are labeled that way.",
+      "setup_minutes": 30
+    },
+    {
+      "id": "marketing",
+      "name": "Marketing Studio",
+      "promise": "Posts, flyers, short videos and website updates, approved by you first.",
+      "examples": ["Three Facebook posts for this week", "A 30-second video explaining our drain service", "Update the website hours"],
+      "skills": ["business/social-media-content-calendar", "make-video", "publish-website", "design/frontend-design", "design/impeccable", "design/popular-web-designs"],
+      "new_skills": [],
+      "approvals": "Nothing goes public without your yes.",
+      "setup_minutes": 90
+    },
+    {
+      "id": "dashboards",
+      "name": "Dashboards and Tools",
+      "promise": "Ask for a tracker or dashboard by text and get a clean, private one built for your work.",
+      "examples": ["Make me a board of open quotes and who to call back", "Track my jobs this week on my phone", "Show money in and out by week"],
+      "skills": ["build-dashboard", "private-tools", "design/ui-ux-pro-max", "design/frontend-design", "design/webapp-testing", "design/sketch"],
+      "new_skills": [],
+      "approvals": "It asks a few questions, shows a plan and a screenshot, and only goes live after your yes.",
+      "setup_minutes": 45
+    }
+  ]
+}

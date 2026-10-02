@@ -303,7 +303,8 @@ def menu(command: str):
     expected = {"status": 1, "verify": 1, "show-config": 1, "restart": 1,
                 "update-now": 1, "config-get": 2, "config-set": 3,
                 "powerup-on": 2, "powerup-off": 2, "skill-install": 2,
-                "skill-remove": 2, "model-set": 3, "team-key-remove": 2}
+                "skill-remove": 2, "model-set": 3, "team-key-remove": 2,
+                "packs-set": 3}
     if op not in expected or len(args) != expected[op]:
         raise ValueError("Command refused")
     if op.startswith("config-"):
@@ -322,6 +323,8 @@ def menu(command: str):
         raise ValueError("Skill refused")
     if op == "team-key-remove" and not FINGERPRINT.fullmatch(args[1]):
         raise ValueError("Expected SHA256 fingerprint")
+    if op == "packs-set" and not ID.fullmatch(args[2]):
+        raise ValueError("Pack consent ID refused")
     return args
 
 
@@ -370,6 +373,8 @@ def _execute(args: list[str]):
         run(["runuser", "-u", "hermes", "--", "env", "HOME=/home/hermes", "HERMES_HOME=/home/hermes/.hermes", HERMES_BIN, "-p", "client", "config", "get" if op == "config-get" else "set", *args[1:]])
     elif op.startswith("powerup-"):
         run(["/usr/local/bin/kit-powerup", "on" if op.endswith("on") else "off", args[1]])
+    elif op == "packs-set":
+        run(["/usr/local/bin/kit-packs", "set", args[1], "--consent-id", args[2]])
     elif op.startswith("skill-"):
         catalog = json.loads((KIT / "catalog" / "skills.json").read_text())
         if args[1] not in catalog:

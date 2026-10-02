@@ -252,9 +252,13 @@ if consent_exists logins; then
   approved_disabled=$(jq -c 'map(select(. != "browser"))' <<<"$approved_disabled")
   approved_platform_tools=$(jq -c '. + ["browser"]' <<<"$approved_platform_tools")
 fi
+if consent_exists schedules; then
+  approved_disabled=$(jq -c 'map(select(. != "cronjob"))' <<<"$approved_disabled")
+fi
 approved_platform_tools=$(expected_mcp_tools cli "$approved_platform_tools")
 cron_tools=$(expected_mcp_tools cron '["clarify","file","memory","search","skills","todo","vision","web"]')
 if effective_json_is agent.disabled_toolsets "$approved_disabled" && effective_json_is platform_toolsets.cli "$approved_platform_tools" && effective_json_is platform_toolsets.cron "$cron_tools"; then pass 'effective global and cron tool policy exactly matches approved capabilities'; else fail 'effective global and cron tool policy exactly matches approved capabilities'; fi
+if effective_value plugins.enabled 2>/dev/null | jq -e 'type == "array" and index("kit-welcome") != null' >/dev/null && [[ -f $hermes_home/plugins/kit-welcome/__init__.py && -f $hermes_home/plugins/kit-welcome/kit_quota_notice.py ]]; then pass 'owner welcome and provider-limit hooks installed'; else fail 'owner welcome or provider-limit hook missing'; fi
 if consent_exists logins; then
   logins_domains=$(python3 - "$kit_dir/lib" <<'PY'
 import json, sys
@@ -282,7 +286,8 @@ sys.path.insert(0, sys.argv[1])
 from kit_powerup import validate_cron_jobs
 validate_cron_jobs()
 PY
-  then pass 'SCHEDULES are local read and draft only'; else fail 'SCHEDULES unsafe job configuration'; fi
+  then pass 'SCHEDULES owner-only targets, safe intervals, and 20-job limit'; else fail 'SCHEDULES unsafe job configuration'; fi
+  if effective_value plugins.enabled 2>/dev/null | jq -e 'type == "array" and index("kit-reminders") != null and index("kit-welcome") != null' >/dev/null && [[ -f $hermes_home/plugins/kit-reminders/__init__.py ]]; then pass 'SCHEDULES cron guard installed'; else fail 'SCHEDULES cron guard missing'; fi
 elif [[ -f $hermes_home/cron/jobs.json ]] && jq -e '(if type == "array" then . else .jobs // [] end) | any(.[]; .enabled != false)' "$hermes_home/cron/jobs.json" >/dev/null 2>&1; then
   fail 'SCHEDULES active without consent'
 fi
@@ -404,6 +409,7 @@ esac
 if [[ $MESSAGING_PLATFORM != none ]]; then
   messaging_tools=$(expected_mcp_tools "$MESSAGING_PLATFORM" '["clarify","file","memory","search","skills","todo","vision","web"]')
   if consent_exists logins; then messaging_tools=$(expected_mcp_tools "$MESSAGING_PLATFORM" '["clarify","file","memory","search","skills","todo","vision","web","browser"]'); fi
+  if consent_exists schedules; then messaging_tools=$(expected_mcp_tools "$MESSAGING_PLATFORM" '["clarify","file","memory","search","skills","todo","vision","web","cronjob"]'); fi
   if ! effective_json_is "platform_toolsets.$MESSAGING_PLATFORM" "$messaging_tools"; then fail "$MESSAGING_PLATFORM effective tool policy matches baseline"; fi
 fi
 if [[ -n ${messaging_allowlist:-} ]]; then
@@ -444,7 +450,19 @@ fi
 
 if [[ -f "$hermes_home/distribution.yaml" ]]; then pass 'client profile distribution installed'; else fail 'client profile distribution installed'; fi
 if cmp -s "$kit_dir/profile/GUIDE.md" "$hermes_home/GUIDE.md" && cmp -s "$kit_dir/profile/NOTICE" "$hermes_home/NOTICE"; then pass 'client guide and MIT notice installed'; else fail 'client guide or MIT notice differs'; fi
-if python3 "$kit_dir/lib/kit_profile.py" verify "$kit_dir/profile" "$hermes_home" "${ASSISTANT_NAME:-}" >/dev/null 2>&1; then pass 'shipped profile templates and skill tree match'; else fail 'shipped profile templates or skill tree differ'; fi
+if python3 "$kit_dir/lib/kit_profile.py" verify "$kit_dir/profile" "$hermes_home" "${ASSISTANT_NAME:-}" --selection /etc/hermes-kit/packs.json >/dev/null 2>&1 && python3 "$kit_dir/lib/kit_packs.py" verify "$kit_dir/profile" "$hermes_home" /etc/hermes-kit/packs.json /etc/hermes-kit/consents.json >/dev/null 2>&1; then pass 'installed skills match selected packs'; else fail 'installed skills differ from selected packs'; fi
+
+if [[ -f /home/hermes/vault/business/BRIEF.md && $(stat -c '%U:%a' /home/hermes/vault/business/BRIEF.md 2>/dev/null) == hermes:600 ]]; then pass 'Business Brief is private and owned by hermes'; else fail 'Business Brief missing or permissions wrong'; fi
+if [[ -x /opt/hermes-kit/office-venv/bin/python ]] && /opt/hermes-kit/office-venv/bin/python - "$kit_dir/lib/office-requirements.txt" <<'PYREQ'
+from importlib.metadata import version
+from pathlib import Path
+import sys
+for line in Path(sys.argv[1]).read_text().splitlines():
+    package, wanted = line.split('==')
+    assert version(package) == wanted
+PYREQ
+then pass 'pinned office environment ready'; else fail 'pinned office environment missing or differs'; fi
+
 if cmp -s "$kit_dir/profile/GUIDE.md" "$hermes_home/GUIDE.md" && cmp -s "$kit_dir/profile/NOTICE" "$hermes_home/NOTICE" && grep -Fq 'MIT' "$hermes_home/NOTICE"; then pass 'client guide and MIT attribution intact'; else fail 'client guide or MIT attribution differs'; fi
 if [[ ${ASSISTANT_NAME:-} == Donna ]] || ! grep -Fq 'Donna' "$hermes_home/SOUL.md"; then pass 'assistant name has no stale Donna persona'; else fail 'assistant name contains stale Donna persona'; fi
 if [[ -e "$hermes_home/skills/productivity/google-workspace" ]]; then fail 'google-workspace skill absent by default'; else pass 'google-workspace skill absent by default'; fi
@@ -462,12 +480,28 @@ if python3 "$kit_dir/lib/kit_mcp_audit.py" >/dev/null 2>&1; then pass 'MCP effec
 unconsented_plugin=false
 while IFS= read -r plugin; do
   [[ -z $plugin || ${ENABLE_HINDSIGHT:-false} == true && $plugin == hindsight ]] && continue
+  # kit-welcome is baseline: always installed by the kit, accepted only while every file matches the pinned kit copy.
+  if [[ $plugin == kit-welcome && -f /etc/hermes-kit/kit-welcome.installed ]] &&
+    cmp -s "$kit_dir/plugins/kit-welcome/__init__.py" "$hermes_home/plugins/kit-welcome/__init__.py" &&
+    cmp -s "$kit_dir/plugins/kit-welcome/plugin.yaml" "$hermes_home/plugins/kit-welcome/plugin.yaml" &&
+    cmp -s "$kit_dir/lib/kit_welcome.py" "$hermes_home/plugins/kit-welcome/kit_welcome.py" &&
+    cmp -s "$kit_dir/lib/kit_reminders.py" "$hermes_home/plugins/kit-welcome/kit_reminders.py" &&
+    cmp -s "$kit_dir/lib/kit_quota_notice.py" "$hermes_home/plugins/kit-welcome/kit_quota_notice.py"; then
+    continue
+  fi
   consent_exists "plugin:$plugin" || unconsented_plugin=true
 done < <(find "$hermes_root/plugins" "$hermes_home/plugins" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -u)
 [[ $unconsented_plugin == false ]] && pass 'plugins are baseline or consented' || fail 'unconsented plugin present'
 starter_plugin="$hermes_home/plugins/kit-starter"
 if consent_exists builder || consent_exists website || consent_exists media; then
-  if consent_exists plugin:kit-starter && cmp -s "$kit_dir/plugins/kit-starter/__init__.py" "$starter_plugin/__init__.py" && cmp -s "$kit_dir/plugins/kit-starter/plugin.yaml" "$starter_plugin/plugin.yaml" && cmp -s "$kit_dir/lib/kit_website.py" "$starter_plugin/kit_website.py" && cmp -s "$kit_dir/lib/kit_video.py" "$starter_plugin/kit_video.py" && [[ $(stat -c '%U:%a' "$starter_plugin/__init__.py" 2>/dev/null) == root:644 ]] && effective_value plugins.enabled 2>/dev/null | jq -e 'type == "array" and index("kit-starter") != null' >/dev/null; then pass 'starter plugin is consented, enabled, and matches pinned kit'; else fail 'starter plugin missing, disabled, or altered'; fi
+  if consent_exists plugin:kit-starter && cmp -s "$kit_dir/plugins/kit-starter/__init__.py" "$starter_plugin/__init__.py" && cmp -s "$kit_dir/plugins/kit-starter/plugin.yaml" "$starter_plugin/plugin.yaml" && cmp -s "$kit_dir/lib/kit_website.py" "$starter_plugin/kit_website.py" && cmp -s "$kit_dir/lib/kit_video.py" "$starter_plugin/kit_video.py" && cmp -s "$kit_dir/lib/kit_site_check.py" "$starter_plugin/kit_site_check.py" && [[ $(stat -c '%U:%a' "$starter_plugin/__init__.py" 2>/dev/null) == root:644 ]] && effective_value plugins.enabled 2>/dev/null | jq -e 'type == "array" and index("kit-starter") != null' >/dev/null; then pass 'starter plugin is consented, enabled, and matches pinned kit'; else fail 'starter plugin missing, disabled, or altered'; fi
+fi
+if consent_exists builder || consent_exists website; then
+  if [[ -x /opt/hermes-kit/qa-venv/bin/python ]] && /opt/hermes-kit/qa-venv/bin/python -c 'from importlib.metadata import version; assert version("playwright") == "1.55.0"' >/dev/null 2>&1 && { command -v chromium >/dev/null || command -v chromium-browser >/dev/null; }; then
+    pass 'Builder website Playwright and Chromium QA ready'
+  else
+    fail 'Builder website Playwright or Chromium QA missing'
+  fi
 fi
 if consent_exists website; then
   if all_tcp_listeners_loopback 8899 && systemctl is-active --quiet hermes-kit-website-preview.service; then pass 'website preview stays on loopback'; else fail 'website preview is unavailable or exposed'; fi
